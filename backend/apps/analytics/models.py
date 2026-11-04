@@ -1,12 +1,13 @@
 """
 Analytics Models for Enterprise LMS
-Provides data models for reporting and analytics.
+Provides data models for reporting, analytics, audit logging, and compliance.
 """
 
 import hashlib
 import json
 import uuid
 from datetime import datetime, timedelta
+from enum import Enum
 
 from django.db import models
 from django.contrib.auth import get_user_model
@@ -17,55 +18,615 @@ from apps.core.models import BaseModel
 User = get_user_model()
 
 
-class UserActivityLog(BaseModel):
+class EventType(models.TextChoices):
+    """Structured event types for UserActivity logging."""
+    LOGIN = 'login', 'Login'
+    LOGOUT = 'logout', 'Logout'
+    ENROLL = 'enroll', 'Enroll'
+    COMPLETE = 'complete', 'Complete'
+    ASSESS = 'assess', 'Assess'
+    GRADE = 'grade', 'Grade'
+    CERTIFY = 'certify', 'Certify'
+    ADMIN_ACTION = 'admin_action', 'Admin Action'
+    VIEW = 'view', 'View'
+    DOWNLOAD = 'download', 'Download'
+    CREATE = 'create', 'Create'
+    UPDATE = 'update', 'Update'
+    DELETE = 'delete', 'Delete'
+
+
+class AuditAction(models.TextChoices):
+    """Administrative action types for AuditLog."""
+    CREATE = 'create', 'Create'
+    UPDATE = 'update', 'Update'
+    DELETE = 'delete', 'Delete'
+    IMPERSONATE = 'impersonate', 'Impersonate'
+    EXPORT = 'export', 'Export'
+    GRANT_ACCESS = 'grant_access', 'Grant Access'
+    REVOKE_ACCESS = 'revoke_access', 'Revoke Access'
+    MODIFY_PERMISSIONS = 'modify_permissions', 'Modify Permissions'
+    BULK_OPERATION = 'bulk_operation', 'Bulk Operation'
+
+
+class ReportStatus(models.TextChoices):
+    """Report generation status."""
+    PENDING = 'pending', 'Pending'
+    PROCESSING = 'processing', 'Processing'
+    COMPLETED = 'completed', 'Completed'
+    FAILED = 'failed', 'Failed'
+    EXPIRED = 'expired', 'Expired'
+
+
+class ReportType(models.TextChoices):
+    """Types of reports that can be generated."""
+    GDPR_EXPORT = 'gdpr_export', 'GDPR Data Export'
+    SOC2_AUDIT = 'soc2_audit', 'SOC 2 Audit Log'
+    LEARNER_PROGRESS = 'learner_progress', 'Learner Progress Report'
+    COURSE_ANALYTICS = 'course_analytics', 'Course Analytics'
+    SYSTEM_HEALTH = 'system_health', 'System Health Report'
+    USER_ACTIVITY = 'user_activity', 'User Activity Report'
+    ENROLLMENT_SUMMARY = 'enrollment_summary', 'Enrollment Summary'
+    ASSESSMENT_RESULTS = 'assessment_results', 'Assessment Results'
+
+
+class UserActivity(BaseModel):
     """
-    Model for tracking user activities across the platform.
+    Immutable log of all user activities with structured event types.
+    Supports GDPR compliance with data retention policies.
     """
-    user = models.ForeignKey(
-        User,
-        on_delete=models.CASCADE,
-        related_name='activity_logs',
-        help_text="User who performed the activity"
-    )
-    action = models.CharField(
-        max_length=100,
-        help_text="Type of activity performed"
-    )
-    entity_type = models.CharField(
+    
+    # Event classification
+    event_type = models.CharField(
         max_length=50,
-        help_text="Type of entity affected (e.g., course, lesson, quiz)"
+        choices=EventType.choices,
+        db_index=True,
+        help_text="Type of activity event"
     )
-    entity_id = models.UUIDField(
+    
+    # Actor information
+    actor = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
         null=True,
         blank=True,
+        related_name='activities',
+        help_text="User who performed the activity"
+    )
+    actor_email = models.EmailField(
+        blank=True,
+        db_index=True,
+        help_text="Email of actor (preserved for deleted users)"
+    )
+    actor_role = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="Role of actor at time of event"
+    )
+    
+    # Target information
+    target_type = models.CharField(
+        max_length=50,
+        blank=True,
+        db_index=True,
+        help_text="Type of entity affected (e.g., course, lesson, quiz, user)"
+    )
+    target_id = models.UUIDField(
+        null=True,
+        blank=True,
+        db_index=True,
         help_text="ID of the affected entity"
     )
+    target_name = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="Human-readable name of target"
+    )
+    
+    # Event details
     metadata = models.JSONField(
         default=dict,
         blank=True,
-        help_text="Additional activity metadata"
+        help_text="Additional structured event metadata"
     )
+    before_state = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="JSON representation of entity before change (for updates)"
+    )
+    after_state = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="JSON representation of entity after change (for updates)"
+    )
+    
+    # Request context
     ip_address = models.GenericIPAddressField(
         null=True,
         blank=True,
+        db_index=True,
         help_text="IP address of the user"
     )
     user_agent = models.TextField(
         blank=True,
         help_text="User agent string"
     )
-
+    request_method = models.CharField(
+        max_length=10,
+        blank=True,
+        help_text="HTTP method"
+    )
+    request_path = models.CharField(
+        max_length=500,
+        blank=True,
+        help_text="Request path"
+    )
+    session_id = models.CharField(
+        max_length=255,
+        blank=True,
+        db_index=True,
+        help_text="Session identifier"
+    )
+    
+    # Timing
+    timestamp = models.DateTimeField(
+        default=timezone.now,
+        db_index=True,
+        help_text="When the event occurred"
+    )
+    
+    # Data retention for GDPR
+    pii_anonymized = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="Whether PII has been anonymized"
+    )
+    anonymized_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When PII was anonymized"
+    )
+    retention_until = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Date when this record can be permanently deleted"
+    )
+    
     class Meta:
-        verbose_name = "User Activity Log"
-        verbose_name_plural = "User Activity Logs"
+        verbose_name = "User Activity"
+        verbose_name_plural = "User Activities"
+        ordering = ['-timestamp']
+        indexes = [
+            models.Index(fields=['actor', 'event_type', 'timestamp']),
+            models.Index(fields=['target_type', 'target_id', 'timestamp']),
+            models.Index(fields=['event_type', 'timestamp']),
+            models.Index(fields=['ip_address', 'timestamp']),
+            models.Index(fields=['session_id', 'timestamp']),
+            models.Index(fields=['pii_anonymized', 'retention_until']),
+            models.Index(fields=['timestamp', 'pii_anonymized']),
+        ]
+    
+    def __str__(self):
+        actor = self.actor_email or (self.actor.email if self.actor else 'Anonymous')
+        return f"{self.event_type} by {actor} at {self.timestamp}"
+    
+    def anonymize_pii(self):
+        """
+        Anonymize PII fields for GDPR compliance.
+        Hashes email, clears IP, and marks as anonymized.
+        """
+        if not self.pii_anonymized:
+            # Hash the email for anonymization
+            if self.actor_email:
+                self.actor_email = hashlib.sha256(
+                    self.actor_email.encode('utf-8')
+                ).hexdigest()[:32]
+            
+            # Clear IP address
+            self.ip_address = None
+            
+            # Remove PII from metadata
+            if self.metadata:
+                pii_keys = ['email', 'phone', 'address', 'full_name', 'first_name', 'last_name']
+                for key in pii_keys:
+                    if key in self.metadata:
+                        del self.metadata[key]
+            
+            self.pii_anonymized = True
+            self.anonymized_at = timezone.now()
+            self.save(update_fields=[
+                'actor_email', 'ip_address', 'metadata',
+                'pii_anonymized', 'anonymized_at', 'updated_at'
+            ])
+    
+    @classmethod
+    def log_activity(cls, event_type, actor=None, target_type='', target_id=None,
+                     target_name='', metadata=None, before_state=None, after_state=None,
+                     ip_address=None, user_agent='', request_method='', request_path='',
+                     session_id=''):
+        """
+        Factory method to create a user activity log entry.
+        """
+        if metadata is None:
+            metadata = {}
+        
+        return cls.objects.create(
+            event_type=event_type,
+            actor=actor,
+            actor_email=actor.email if actor else '',
+            actor_role=actor.role if actor and hasattr(actor, 'role') else '',
+            target_type=target_type,
+            target_id=target_id,
+            target_name=target_name,
+            metadata=metadata,
+            before_state=before_state,
+            after_state=after_state,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            request_method=request_method,
+            request_path=request_path,
+            session_id=session_id,
+            timestamp=timezone.now(),
+            retention_until=timezone.now() + timedelta(days=7*365)  # 7 years
+        )
+
+
+class AuditLog(BaseModel):
+    """
+    Administrative audit log for sensitive operations.
+    Requires justification for sensitive actions.
+    """
+    
+    # Action details
+    action = models.CharField(
+        max_length=50,
+        choices=AuditAction.choices,
+        db_index=True,
+        help_text="Type of administrative action performed"
+    )
+    
+    # Actor information
+    actor = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='audit_logs',
+        help_text="Administrator who performed the action"
+    )
+    actor_email = models.EmailField(
+        blank=True,
+        help_text="Email of actor (preserved for deleted users)"
+    )
+    actor_ip = models.GenericIPAddressField(
+        null=True,
+        blank=True,
+        help_text="IP address of administrator"
+    )
+    
+    # Target information
+    resource_type = models.CharField(
+        max_length=50,
+        db_index=True,
+        help_text="Type of resource affected"
+    )
+    resource_id = models.CharField(
+        max_length=255,
+        db_index=True,
+        help_text="ID of affected resource"
+    )
+    resource_name = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="Human-readable name of resource"
+    )
+    
+    # Change tracking
+    changes = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="JSON diff of changes made"
+    )
+    before_state = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Complete state before change"
+    )
+    after_state = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Complete state after change"
+    )
+    
+    # Justification (required for sensitive actions)
+    justification = models.TextField(
+        blank=True,
+        help_text="Reason for performing this action"
+    )
+    is_sensitive = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="Whether this is a sensitive action requiring justification"
+    )
+    
+    # Outcome
+    outcome = models.CharField(
+        max_length=50,
+        default='success',
+        db_index=True,
+        help_text="Outcome of the action (success/failure/blocked)"
+    )
+    error_message = models.TextField(
+        blank=True,
+        help_text="Error message if action failed"
+    )
+    
+    # Request context
+    user_agent = models.TextField(
+        blank=True,
+        help_text="User agent string"
+    )
+    request_id = models.CharField(
+        max_length=255,
+        blank=True,
+        db_index=True,
+        help_text="Request correlation ID"
+    )
+    
+    # Timing
+    timestamp = models.DateTimeField(
+        default=timezone.now,
+        db_index=True,
+        help_text="When the action was performed"
+    )
+    
+    # Data retention
+    retention_until = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Date when this record can be archived"
+    )
+    
+    class Meta:
+        verbose_name = "Audit Log"
+        verbose_name_plural = "Audit Logs"
+        ordering = ['-timestamp']
+        indexes = [
+            models.Index(fields=['actor', 'action', 'timestamp']),
+            models.Index(fields=['resource_type', 'resource_id', 'timestamp']),
+            models.Index(fields=['action', 'outcome', 'timestamp']),
+            models.Index(fields=['is_sensitive', 'timestamp']),
+            models.Index(fields=['request_id', 'timestamp']),
+        ]
+    
+    def __str__(self):
+        actor = self.actor_email or (self.actor.email if self.actor else 'System')
+        return f"{self.action} on {self.resource_type} by {actor}"
+    
+    def clean(self):
+        """Validate that sensitive actions have justification."""
+        from django.core.exceptions import ValidationError
+        if self.is_sensitive and not self.justification:
+            raise ValidationError({
+                'justification': 'Justification is required for sensitive administrative actions.'
+            })
+    
+    def save(self, *args, **kwargs):
+        self.clean()
+        if not self.retention_until:
+            # Audit logs kept for 10 years
+            self.retention_until = timezone.now() + timedelta(days=10*365)
+        super().save(*args, **kwargs)
+    
+    @classmethod
+    def log_admin_action(cls, action, actor, resource_type, resource_id,
+                         resource_name='', changes=None, before_state=None,
+                         after_state=None, justification='', is_sensitive=False,
+                         outcome='success', error_message='', actor_ip=None,
+                         user_agent='', request_id=''):
+        """
+        Factory method to create an audit log entry.
+        """
+        if changes is None:
+            changes = {}
+        
+        return cls.objects.create(
+            action=action,
+            actor=actor,
+            actor_email=actor.email if actor else 'system@lms.local',
+            actor_ip=actor_ip,
+            resource_type=resource_type,
+            resource_id=str(resource_id),
+            resource_name=resource_name,
+            changes=changes,
+            before_state=before_state,
+            after_state=after_state,
+            justification=justification,
+            is_sensitive=is_sensitive,
+            outcome=outcome,
+            error_message=error_message,
+            user_agent=user_agent,
+            request_id=request_id,
+            timestamp=timezone.now()
+        )
+
+
+class ReportJob(BaseModel):
+    """
+    Async report generation job with secure delivery.
+    """
+    
+    # Report configuration
+    report_type = models.CharField(
+        max_length=50,
+        choices=ReportType.choices,
+        help_text="Type of report to generate"
+    )
+    name = models.CharField(
+        max_length=255,
+        help_text="Human-readable name for this report"
+    )
+    description = models.TextField(
+        blank=True,
+        help_text="Description of report contents"
+    )
+    
+    # Requester
+    requested_by = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='report_jobs',
+        help_text="User who requested this report"
+    )
+    
+    # Report parameters
+    parameters = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Report generation parameters"
+    )
+    filters = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Filters applied to the report"
+    )
+    date_range_start = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Start of date range for report"
+    )
+    date_range_end = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="End of date range for report"
+    )
+    
+    # Status tracking
+    status = models.CharField(
+        max_length=20,
+        choices=ReportStatus.choices,
+        default=ReportStatus.PENDING,
+        db_index=True,
+        help_text="Current status of report generation"
+    )
+    progress_percent = models.IntegerField(
+        default=0,
+        help_text="Report generation progress (0-100)"
+    )
+    
+    # Output
+    file_format = models.CharField(
+        max_length=10,
+        default='csv',
+        help_text="Output file format (csv, pdf, xlsx, json)"
+    )
+    file_size = models.BigIntegerField(
+        null=True,
+        blank=True,
+        help_text="Size of generated file in bytes"
+    )
+    file_url = models.URLField(
+        max_length=1000,
+        blank=True,
+        help_text="Secure download URL for the report"
+    )
+    expires_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the download link expires"
+    )
+    
+    # Error handling
+    error_message = models.TextField(
+        blank=True,
+        help_text="Error message if generation failed"
+    )
+    retry_count = models.IntegerField(
+        default=0,
+        help_text="Number of retry attempts"
+    )
+    
+    # Timing
+    started_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When report generation started"
+    )
+    completed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When report generation completed"
+    )
+    
+    # Notification
+    notify_on_complete = models.BooleanField(
+        default=True,
+        help_text="Whether to notify user when complete"
+    )
+    notification_sent = models.BooleanField(
+        default=False,
+        help_text="Whether completion notification was sent"
+    )
+    
+    class Meta:
+        verbose_name = "Report Job"
+        verbose_name_plural = "Report Jobs"
         ordering = ['-created_at']
         indexes = [
-            models.Index(fields=['user', 'action', 'created_at']),
-            models.Index(fields=['entity_type', 'entity_id']),
+            models.Index(fields=['requested_by', 'status', 'created_at']),
+            models.Index(fields=['report_type', 'status', 'created_at']),
+            models.Index(fields=['status', 'created_at']),
+            models.Index(fields=['expires_at', 'status']),
         ]
-
+    
     def __str__(self):
-        return f"{self.user.email} - {self.action} at {self.created_at}"
+        return f"{self.name} ({self.status})"
+    
+    def mark_started(self):
+        """Mark report as started processing."""
+        self.status = ReportStatus.PROCESSING
+        self.started_at = timezone.now()
+        self.save(update_fields=['status', 'started_at', 'updated_at'])
+    
+    def mark_completed(self, file_url='', file_size=0):
+        """Mark report as completed with download URL."""
+        self.status = ReportStatus.COMPLETED
+        self.progress_percent = 100
+        self.completed_at = timezone.now()
+        self.file_url = file_url
+        self.file_size = file_size
+        self.expires_at = timezone.now() + timedelta(days=7)
+        self.save(update_fields=[
+            'status', 'progress_percent', 'completed_at',
+            'file_url', 'file_size', 'expires_at', 'updated_at'
+        ])
+    
+    def mark_failed(self, error_message):
+        """Mark report as failed with error message."""
+        self.status = ReportStatus.FAILED
+        self.error_message = error_message
+        self.completed_at = timezone.now()
+        self.save(update_fields=['status', 'error_message', 'completed_at', 'updated_at'])
+    
+    def update_progress(self, percent):
+        """Update report generation progress."""
+        self.progress_percent = min(max(percent, 0), 100)
+        self.save(update_fields=['progress_percent', 'updated_at'])
+    
+    def is_expired(self):
+        """Check if the download link has expired."""
+        if self.expires_at:
+            return timezone.now() > self.expires_at
+        return False
+    
+    def can_download(self):
+        """Check if report is available for download."""
+        return (
+            self.status == ReportStatus.COMPLETED and
+            self.file_url and
+            not self.is_expired()
+        )
 
 
 class SecurityAuditLog(BaseModel):
@@ -353,51 +914,35 @@ class SecurityAuditLog(BaseModel):
             user_agent=user_agent,
             request_method=request_method,
             request_path=request_path,
+            timestamp=timezone.now(),
             response_time_ms=response_time_ms
         )
 
 
 class AuditLogExport(BaseModel):
     """
-    Model for tracking audit log exports.
-    Required for compliance - tracks who exported audit data and when.
+    Export job for audit logs with compliance controls.
     """
     
-    STATUS_PENDING = 'pending'
-    STATUS_PROCESSING = 'processing'
-    STATUS_COMPLETED = 'completed'
-    STATUS_FAILED = 'failed'
-    
-    STATUS_CHOICES = [
-        (STATUS_PENDING, 'Pending'),
-        (STATUS_PROCESSING, 'Processing'),
-        (STATUS_COMPLETED, 'Completed'),
-        (STATUS_FAILED, 'Failed'),
+    EXPORT_FORMAT_CHOICES = [
+        ('json', 'JSON'),
+        ('csv', 'CSV'),
+        ('pdf', 'PDF'),
     ]
     
-    FORMAT_CSV = 'csv'
-    FORMAT_JSON = 'json'
-    FORMAT_PDF = 'pdf'
-    
-    FORMAT_CHOICES = [
-        (FORMAT_CSV, 'CSV'),
-        (FORMAT_JSON, 'JSON'),
-        (FORMAT_PDF, 'PDF'),
+    EXPORT_STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('processing', 'Processing'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
     ]
     
-    requested_by = models.ForeignKey(
-        User,
-        on_delete=models.CASCADE,
-        related_name='audit_exports',
-        help_text="User who requested the export"
-    )
-    
-    # Export Parameters
+    # Export configuration
     start_date = models.DateTimeField(
-        help_text="Start of export date range"
+        help_text="Start date for export range"
     )
     end_date = models.DateTimeField(
-        help_text="End of export date range"
+        help_text="End date for export range"
     )
     event_categories = models.JSONField(
         default=list,
@@ -410,53 +955,63 @@ class AuditLogExport(BaseModel):
         help_text="Filter by severity levels"
     )
     
-    # Export Configuration
-    export_format = models.CharField(
+    # Requester
+    requested_by = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='audit_exports',
+        help_text="User who requested this export"
+    )
+    
+    # Export settings
+    format = models.CharField(
         max_length=10,
-        choices=FORMAT_CHOICES,
-        default=FORMAT_CSV,
+        choices=EXPORT_FORMAT_CHOICES,
+        default='json',
         help_text="Export file format"
     )
+    include_verification = models.BooleanField(
+        default=True,
+        help_text="Include hash chain verification in export"
+    )
     
-    # Export Status
+    # Status
     status = models.CharField(
         max_length=20,
-        choices=STATUS_CHOICES,
-        default=STATUS_PENDING,
-        help_text="Export status"
+        choices=EXPORT_STATUS_CHOICES,
+        default='pending',
+        help_text="Current export status"
     )
     
-    # Results
-    file_path = models.CharField(
-        max_length=500,
-        blank=True,
-        help_text="Path to exported file"
-    )
-    file_size = models.BigIntegerField(
+    # Output
+    file = models.FileField(
+        upload_to='audit_exports/%Y/%m/',
         null=True,
         blank=True,
-        help_text="Size of exported file in bytes"
+        help_text="Exported audit log file"
     )
     record_count = models.IntegerField(
         null=True,
         blank=True,
         help_text="Number of records exported"
     )
-    error_message = models.TextField(
-        blank=True,
-        help_text="Error message if export failed"
-    )
     
-    # Timestamps
-    started_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text="When export processing started"
+    # Compliance
+    justification = models.TextField(
+        help_text="Business justification for this export"
     )
-    completed_at = models.DateTimeField(
+    approved_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        help_text="When export completed"
+        related_name='approved_audit_exports',
+        help_text="Administrator who approved this export"
+    )
+    approved_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the export was approved"
     )
     
     class Meta:
@@ -465,642 +1020,240 @@ class AuditLogExport(BaseModel):
         ordering = ['-created_at']
     
     def __str__(self):
-        return f"Export by {self.requested_by.email} ({self.start_date} to {self.end_date})"
+        return f"Export {self.start_date} to {self.end_date} ({self.status})"
 
-
-# =============================================================================
-# Email A/B Testing Models
-# =============================================================================
 
 class ABTestCampaign(BaseModel):
     """
-    Model for managing email A/B test campaigns.
-    Tracks campaign configuration, status, and overall performance metrics.
+    A/B test campaign for analytics experiments.
     """
     
-    # Campaign Status
-    STATUS_DRAFT = 'draft'
-    STATUS_SCHEDULED = 'scheduled'
-    STATUS_RUNNING = 'running'
-    STATUS_PAUSED = 'paused'
-    STATUS_COMPLETED = 'completed'
-    STATUS_CANCELLED = 'cancelled'
-    
     STATUS_CHOICES = [
-        (STATUS_DRAFT, 'Draft'),
-        (STATUS_SCHEDULED, 'Scheduled'),
-        (STATUS_RUNNING, 'Running'),
-        (STATUS_PAUSED, 'Paused'),
-        (STATUS_COMPLETED, 'Completed'),
-        (STATUS_CANCELLED, 'Cancelled'),
+        ('draft', 'Draft'),
+        ('running', 'Running'),
+        ('paused', 'Paused'),
+        ('completed', 'Completed'),
+        ('cancelled', 'Cancelled'),
     ]
     
-    # Test Type
-    TEST_TYPE_SUBJECT = 'subject'
-    TEST_TYPE_CONTENT = 'content'
-    TEST_TYPE_SENDER = 'sender'
-    TEST_TYPE_TIMING = 'timing'
-    TEST_TYPE_TEMPLATE = 'template'
-    
-    TEST_TYPE_CHOICES = [
-        (TEST_TYPE_SUBJECT, 'Subject Line'),
-        (TEST_TYPE_CONTENT, 'Email Content'),
-        (TEST_TYPE_SENDER, 'Sender Name/Email'),
-        (TEST_TYPE_TIMING, 'Send Timing'),
-        (TEST_TYPE_TEMPLATE, 'Template Design'),
-    ]
-    
-    # Winner Selection Criteria
-    WINNER_CRITERIA_OPENS = 'opens'
-    WINNER_CRITERIA_CLICKS = 'clicks'
-    WINNER_CRITERIA_CONVERSIONS = 'conversions'
-    WINNER_CRITERIA_REVENUE = 'revenue'
-    
-    WINNER_CRITERIA_CHOICES = [
-        (WINNER_CRITERIA_OPENS, 'Open Rate'),
-        (WINNER_CRITERIA_CLICKS, 'Click Rate'),
-        (WINNER_CRITERIA_CONVERSIONS, 'Conversions'),
-        (WINNER_CRITERIA_REVENUE, 'Revenue'),
-    ]
-    
-    id = models.UUIDField(
-        primary_key=True,
-        default=uuid.uuid4,
-        editable=False
-    )
-    
-    # Campaign Info
     name = models.CharField(
         max_length=255,
-        help_text="Name of the A/B test campaign"
+        help_text="Campaign name"
     )
     description = models.TextField(
         blank=True,
-        help_text="Description of the campaign and test hypothesis"
+        help_text="Campaign description"
+    )
+    hypothesis = models.TextField(
+        blank=True,
+        help_text="Test hypothesis"
     )
     
-    # Test Configuration
-    test_type = models.CharField(
-        max_length=50,
-        choices=TEST_TYPE_CHOICES,
-        default=TEST_TYPE_SUBJECT,
-        help_text="What aspect of the email is being tested"
+    # Targeting
+    target_segment = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="User segment criteria"
+    )
+    traffic_allocation = models.IntegerField(
+        default=100,
+        help_text="Percentage of traffic to include"
     )
     
-    # Winner Selection
-    winner_criteria = models.CharField(
-        max_length=50,
-        choices=WINNER_CRITERIA_CHOICES,
-        default=WINNER_CRITERIA_OPENS,
-        help_text="Metric used to determine the winning variant"
+    # Timing
+    start_date = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the campaign starts"
     )
-    winner_selection_delay_hours = models.PositiveIntegerField(
-        default=24,
-        help_text="Hours to wait before selecting winner (minimum test duration)"
-    )
-    winner_confidence_threshold = models.DecimalField(
-        max_digits=5,
-        decimal_places=4,
-        default=0.95,
-        help_text="Statistical confidence threshold for winner selection (0.0-1.0)"
-    )
-    
-    # Sample Size
-    test_percentage = models.PositiveIntegerField(
-        default=20,
-        help_text="Percentage of recipients to include in the test phase"
+    end_date = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the campaign ends"
     )
     
     # Status
     status = models.CharField(
-        max_length=50,
+        max_length=20,
         choices=STATUS_CHOICES,
-        default=STATUS_DRAFT,
-        db_index=True,
-        help_text="Current status of the campaign"
+        default='draft',
+        help_text="Current campaign status"
     )
     
-    # Scheduling
-    scheduled_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text="When the campaign should start"
+    # Metrics
+    primary_metric = models.CharField(
+        max_length=100,
+        help_text="Primary success metric"
     )
-    started_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text="When the campaign actually started"
-    )
-    completed_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text="When the campaign completed"
-    )
-    winner_declared_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text="When the winning variant was determined"
-    )
-    
-    # Winner Reference
-    winning_variant = models.ForeignKey(
-        'ABTestVariant',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='won_campaigns',
-        help_text="The winning variant of this test"
-    )
-    
-    # Target Audience
-    target_segment = models.JSONField(
-        default=dict,
-        blank=True,
-        help_text="JSON criteria for target audience segmentation"
-    )
-    recipient_count = models.PositiveIntegerField(
-        default=0,
-        help_text="Total number of recipients in the campaign"
-    )
-    
-    # Created by
-    created_by = models.ForeignKey(
-        User,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='ab_test_campaigns',
-        help_text="User who created this campaign"
+    minimum_sample_size = models.IntegerField(
+        default=100,
+        help_text="Minimum participants per variant"
     )
     
     class Meta:
         verbose_name = "A/B Test Campaign"
         verbose_name_plural = "A/B Test Campaigns"
         ordering = ['-created_at']
-        indexes = [
-            models.Index(fields=['status', 'scheduled_at']),
-            models.Index(fields=['test_type', 'status']),
-            models.Index(fields=['created_by', 'created_at']),
-        ]
     
     def __str__(self):
-        return f"{self.name} ({self.get_test_type_display()})"
-    
-    def can_start(self):
-        """Check if the campaign is ready to start."""
-        if self.status != self.STATUS_SCHEDULED:
-            return False
-        if not self.scheduled_at:
-            return False
-        return timezone.now() >= self.scheduled_at
-    
-    def get_test_duration(self):
-        """Get the duration of the test in hours."""
-        if not self.started_at:
-            return 0
-        end_time = self.winner_declared_at or self.completed_at or timezone.now()
-        duration = end_time - self.started_at
-        return duration.total_seconds() / 3600
-    
-    def is_winner_selection_ready(self):
-        """Check if enough time has passed to select a winner."""
-        if not self.started_at:
-            return False
-        min_end_time = self.started_at + timedelta(hours=self.winner_selection_delay_hours)
-        return timezone.now() >= min_end_time
+        return self.name
 
 
 class ABTestVariant(BaseModel):
     """
-    Model for individual A/B test variants.
-    Tracks performance metrics for each variant in a campaign.
+    Variant for A/B testing.
     """
     
-    id = models.UUIDField(
-        primary_key=True,
-        default=uuid.uuid4,
-        editable=False
-    )
-    
-    # Relationship to Campaign
     campaign = models.ForeignKey(
         ABTestCampaign,
         on_delete=models.CASCADE,
         related_name='variants',
-        help_text="The A/B test campaign this variant belongs to"
+        help_text="Parent campaign"
     )
-    
-    # Variant Info
     name = models.CharField(
         max_length=100,
-        help_text="Name of the variant (e.g., 'Variant A', 'Control')"
+        help_text="Variant name"
     )
     description = models.TextField(
         blank=True,
-        help_text="Description of what makes this variant different"
+        help_text="Variant description"
+    )
+    traffic_percentage = models.IntegerField(
+        default=50,
+        help_text="Percentage of traffic for this variant"
     )
     
-    # Variant Content (varies by test type)
-    subject_line = models.CharField(
-        max_length=255,
-        blank=True,
-        help_text="Subject line for this variant (for subject line tests)"
+    # Configuration
+    configuration = models.JSONField(
+        default=dict,
+        help_text="Variant-specific configuration"
     )
-    sender_name = models.CharField(
-        max_length=100,
-        blank=True,
-        help_text="Sender name for this variant"
-    )
-    sender_email = models.EmailField(
-        blank=True,
-        help_text="Sender email for this variant"
-    )
-    content_html = models.TextField(
-        blank=True,
-        help_text="HTML content for this variant (for content tests)"
-    )
-    content_text = models.TextField(
-        blank=True,
-        help_text="Plain text content for this variant"
-    )
-    template_id = models.CharField(
-        max_length=255,
-        blank=True,
-        help_text="Template ID for this variant (for template tests)"
-    )
-    send_time_offset_hours = models.IntegerField(
-        default=0,
-        help_text="Hours to offset send time (for timing tests)"
-    )
-    
-    # Traffic Allocation
-    traffic_percentage = models.DecimalField(
-        max_digits=5,
-        decimal_places=2,
-        default=50.00,
-        help_text="Percentage of test traffic allocated to this variant"
-    )
-    
-    # Performance Metrics
-    recipients_count = models.PositiveIntegerField(
-        default=0,
-        help_text="Number of recipients for this variant"
-    )
-    delivered_count = models.PositiveIntegerField(
-        default=0,
-        help_text="Number of successfully delivered emails"
-    )
-    bounced_count = models.PositiveIntegerField(
-        default=0,
-        help_text="Number of bounced emails"
-    )
-    opened_count = models.PositiveIntegerField(
-        default=0,
-        help_text="Number of unique opens"
-    )
-    clicked_count = models.PositiveIntegerField(
-        default=0,
-        help_text="Number of unique clicks"
-    )
-    unsubscribed_count = models.PositiveIntegerField(
-        default=0,
-        help_text="Number of unsubscribes"
-    )
-    complained_count = models.PositiveIntegerField(
-        default=0,
-        help_text="Number of spam complaints"
-    )
-    converted_count = models.PositiveIntegerField(
-        default=0,
-        help_text="Number of conversions attributed to this variant"
-    )
-    revenue_generated = models.DecimalField(
-        max_digits=15,
-        decimal_places=2,
-        default=0.00,
-        help_text="Revenue generated from this variant"
-    )
-    
-    # Calculated Rates (stored for performance)
-    open_rate = models.DecimalField(
-        max_digits=6,
-        decimal_places=4,
-        null=True,
-        blank=True,
-        help_text="Open rate as decimal (e.g., 0.25 for 25%)"
-    )
-    click_rate = models.DecimalField(
-        max_digits=6,
-        decimal_places=4,
-        null=True,
-        blank=True,
-        help_text="Click rate as decimal"
-    )
-    click_to_open_rate = models.DecimalField(
-        max_digits=6,
-        decimal_places=4,
-        null=True,
-        blank=True,
-        help_text="Click-to-open rate (clicks/opens)"
-    )
-    bounce_rate = models.DecimalField(
-        max_digits=6,
-        decimal_places=4,
-        null=True,
-        blank=True,
-        help_text="Bounce rate as decimal"
-    )
-    unsubscribe_rate = models.DecimalField(
-        max_digits=6,
-        decimal_places=4,
-        null=True,
-        blank=True,
-        help_text="Unsubscribe rate as decimal"
-    )
-    complaint_rate = models.DecimalField(
-        max_digits=6,
-        decimal_places=4,
-        null=True,
-        blank=True,
-        help_text="Complaint rate as decimal"
-    )
-    conversion_rate = models.DecimalField(
-        max_digits=6,
-        decimal_places=4,
-        null=True,
-        blank=True,
-        help_text="Conversion rate as decimal"
-    )
-    
-    # Statistical Analysis
-    is_winner = models.BooleanField(
+    is_control = models.BooleanField(
         default=False,
-        help_text="Whether this variant was selected as the winner"
-    )
-    confidence_level = models.DecimalField(
-        max_digits=5,
-        decimal_places=4,
-        null=True,
-        blank=True,
-        help_text="Statistical confidence that this variant is better than control"
-    )
-    lift_percentage = models.DecimalField(
-        max_digits=7,
-        decimal_places=4,
-        null=True,
-        blank=True,
-        help_text="Percentage improvement over control variant"
+        help_text="Whether this is the control variant"
     )
     
-    # Ordering
-    sort_order = models.PositiveIntegerField(
+    # Metrics
+    participants = models.IntegerField(
         default=0,
-        help_text="Order for displaying variants"
+        help_text="Number of participants"
+    )
+    conversions = models.IntegerField(
+        default=0,
+        help_text="Number of conversions"
     )
     
     class Meta:
         verbose_name = "A/B Test Variant"
         verbose_name_plural = "A/B Test Variants"
-        ordering = ['campaign', 'sort_order', 'created_at']
-        indexes = [
-            models.Index(fields=['campaign', 'is_winner']),
-            models.Index(fields=['campaign', 'sort_order']),
-        ]
-        constraints = [
-            models.UniqueConstraint(
-                fields=['campaign', 'name'],
-                name='unique_variant_name_per_campaign'
-            ),
-        ]
+        unique_together = ['campaign', 'name']
     
     def __str__(self):
         return f"{self.campaign.name} - {self.name}"
     
-    def calculate_rates(self):
-        """Calculate and update all performance rates."""
-        if self.recipients_count > 0:
-            self.open_rate = self.opened_count / self.recipients_count
-            self.click_rate = self.clicked_count / self.recipients_count
-            self.bounce_rate = self.bounced_count / self.recipients_count
-            self.unsubscribe_rate = self.unsubscribed_count / self.recipients_count
-            self.complaint_rate = self.complained_count / self.recipients_count
-            self.conversion_rate = self.converted_count / self.recipients_count
-        
-        if self.opened_count > 0:
-            self.click_to_open_rate = self.clicked_count / self.opened_count
-        
-        self.save(update_fields=[
-            'open_rate', 'click_rate', 'click_to_open_rate',
-            'bounce_rate', 'unsubscribe_rate', 'complaint_rate', 'conversion_rate'
-        ])
-    
-    def get_rate(self, metric):
-        """Get a specific rate by metric name."""
-        rate_map = {
-            'opens': self.open_rate,
-            'clicks': self.click_rate,
-            'conversions': self.conversion_rate,
-            'revenue': self.revenue_generated,
-        }
-        return rate_map.get(metric, self.open_rate)
+    @property
+    def conversion_rate(self):
+        """Calculate conversion rate."""
+        if self.participants == 0:
+            return 0.0
+        return (self.conversions / self.participants) * 100
 
 
 class ABTestRecipientAssignment(BaseModel):
     """
-    Model for tracking which variant each recipient was assigned to.
-    Ensures consistent variant assignment and tracks individual recipient metrics.
+    Tracks which variant a user was assigned to.
     """
     
-    id = models.UUIDField(
-        primary_key=True,
-        default=uuid.uuid4,
-        editable=False
-    )
-    
-    # Relationships
     campaign = models.ForeignKey(
         ABTestCampaign,
         on_delete=models.CASCADE,
-        related_name='recipient_assignments',
-        help_text="The A/B test campaign"
+        related_name='assignments',
+        help_text="Parent campaign"
     )
     variant = models.ForeignKey(
         ABTestVariant,
         on_delete=models.CASCADE,
-        related_name='recipient_assignments',
-        help_text="The variant assigned to this recipient"
+        related_name='assignments',
+        help_text="Assigned variant"
     )
     user = models.ForeignKey(
         User,
         on_delete=models.CASCADE,
         related_name='ab_test_assignments',
-        help_text="The recipient user"
+        help_text="Assigned user"
     )
     
-    # Assignment Info
+    # Assignment
     assigned_at = models.DateTimeField(
         auto_now_add=True,
-        help_text="When this assignment was made"
-    )
-    is_control_group = models.BooleanField(
-        default=False,
-        help_text="Whether this recipient is in the control group"
-    )
-    
-    # Engagement Tracking
-    email_sent = models.BooleanField(
-        default=False,
-        help_text="Whether the email was sent"
-    )
-    sent_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text="When the email was sent"
-    )
-    delivered = models.BooleanField(
-        default=False,
-        help_text="Whether the email was delivered"
-    )
-    delivered_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text="When the email was delivered"
-    )
-    opened = models.BooleanField(
-        default=False,
-        help_text="Whether the email was opened"
-    )
-    opened_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text="When the email was first opened"
-    )
-    open_count = models.PositiveIntegerField(
-        default=0,
-        help_text="Total number of opens"
-    )
-    clicked = models.BooleanField(
-        default=False,
-        help_text="Whether any link was clicked"
-    )
-    clicked_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text="When the first click occurred"
-    )
-    click_count = models.PositiveIntegerField(
-        default=0,
-        help_text="Total number of clicks"
+        help_text="When the assignment was made"
     )
     converted = models.BooleanField(
         default=False,
-        help_text="Whether the recipient converted"
+        help_text="Whether the user converted"
     )
     converted_at = models.DateTimeField(
         null=True,
         blank=True,
         help_text="When the conversion occurred"
     )
-    conversion_value = models.DecimalField(
-        max_digits=15,
-        decimal_places=2,
-        default=0.00,
-        help_text="Value of the conversion"
-    )
-    
-    # Device/Client Info
-    opened_on_device = models.CharField(
-        max_length=50,
-        blank=True,
-        help_text="Device type used to open (desktop, mobile, tablet)"
-    )
-    opened_email_client = models.CharField(
-        max_length=100,
-        blank=True,
-        help_text="Email client used to open"
-    )
     
     class Meta:
-        verbose_name = "A/B Test Recipient Assignment"
-        verbose_name_plural = "A/B Test Recipient Assignments"
-        ordering = ['-assigned_at']
-        indexes = [
-            models.Index(fields=['campaign', 'variant']),
-            models.Index(fields=['user', 'campaign']),
-            models.Index(fields=['campaign', 'opened']),
-            models.Index(fields=['campaign', 'clicked']),
-            models.Index(fields=['campaign', 'converted']),
-        ]
-        constraints = [
-            models.UniqueConstraint(
-                fields=['campaign', 'user'],
-                name='unique_user_assignment_per_campaign'
-            ),
-        ]
+        verbose_name = "A/B Test Assignment"
+        verbose_name_plural = "A/B Test Assignments"
+        unique_together = ['campaign', 'user']
     
     def __str__(self):
         return f"{self.user.email} -> {self.variant.name}"
-    
-    def record_open(self, device_type='', email_client=''):
-        """Record an email open event."""
-        from django.utils import timezone
-        
-        if not self.opened:
-            self.opened = True
-            self.opened_at = timezone.now()
-            self.opened_on_device = device_type
-            self.opened_email_client = email_client
-        
-        self.open_count += 1
-        self.save(update_fields=[
-            'opened', 'opened_at', 'open_count',
-            'opened_on_device', 'opened_email_client'
-        ])
-        
-        # Update variant metrics
-        self.variant.opened_count = ABTestRecipientAssignment.objects.filter(
-            variant=self.variant,
-            opened=True
-        ).count()
-        self.variant.calculate_rates()
-    
-    def record_click(self):
-        """Record a link click event."""
-        from django.utils import timezone
-        
-        if not self.clicked:
-            self.clicked = True
-            self.clicked_at = timezone.now()
-        
-        self.click_count += 1
-        self.save(update_fields=['clicked', 'clicked_at', 'click_count'])
-        
-        # Update variant metrics
-        self.variant.clicked_count = ABTestRecipientAssignment.objects.filter(
-            variant=self.variant,
-            clicked=True
-        ).count()
-        self.variant.calculate_rates()
-    
-    def record_conversion(self, value=0.00):
-        """Record a conversion event."""
-        from django.utils import timezone
-        
-        if not self.converted:
-            self.converted = True
-            self.converted_at = timezone.now()
-            self.conversion_value = value
-            self.save(update_fields=['converted', 'converted_at', 'conversion_value'])
-            
-            # Update variant metrics
-            self.variant.converted_count = ABTestRecipientAssignment.objects.filter(
-                variant=self.variant,
-                converted=True
-            ).count()
-            self.variant.revenue_generated = ABTestRecipientAssignment.objects.filter(
-                variant=self.variant,
-                converted=True
-            ).aggregate(
-                total=models.Sum('conversion_value')
-            )['total'] or 0
-            self.variant.calculate_rates()
+
+
+class UserActivityLog(BaseModel):
+    """
+    Legacy model for tracking user activities across the platform.
+    Kept for backward compatibility - new code should use UserActivity.
+    """
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='legacy_activity_logs',
+        help_text="User who performed the activity"
+    )
+    action = models.CharField(
+        max_length=100,
+        help_text="Type of activity performed"
+    )
+    entity_type = models.CharField(
+        max_length=50,
+        help_text="Type of entity affected (e.g., course, lesson, quiz)"
+    )
+    entity_id = models.UUIDField(
+        null=True,
+        blank=True,
+        help_text="ID of the affected entity"
+    )
+    metadata = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Additional activity metadata"
+    )
+    ip_address = models.GenericIPAddressField(
+        null=True,
+        blank=True,
+        help_text="IP address of the user"
+    )
+    user_agent = models.TextField(
+        blank=True,
+        help_text="User agent string"
+    )
+
+    class Meta:
+        verbose_name = "User Activity Log (Legacy)"
+        verbose_name_plural = "User Activity Logs (Legacy)"
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'action', 'created_at']),
+            models.Index(fields=['entity_type', 'entity_id']),
+        ]
+
+    def __str__(self):
+        return f"{self.user.email} - {self.action} at {self.created_at}"
