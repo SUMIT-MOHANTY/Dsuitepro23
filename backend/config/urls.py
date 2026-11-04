@@ -27,10 +27,14 @@ urlpatterns = [
         # Users app endpoints (authentication and user management)
         path('', include('apps.users.urls')),
         
+        # Courses app endpoints (course catalog and content management)
+        path('', include('apps.courses.urls')),
+        
+        # Assessment app endpoints (quizzes, assignments, grading)
+        path('assessments/', include('apps.assessment.urls', namespace='assessment')),
+        
         # Domain app endpoints (to be implemented by domain agents)
-        # path('courses/', include('apps.courses.urls', namespace='courses')),
         # path('enrollments/', include('apps.enrollment.urls', namespace='enrollment')),
-        # path('assessments/', include('apps.assessment.urls', namespace='assessment')),
         # path('certificates/', include('apps.certificates.urls', namespace='certificates')),
         # path('scorm/', include('apps.scorm.urls', namespace='scorm')),
         # path('forum/', include('apps.forum.urls', namespace='forum')),
