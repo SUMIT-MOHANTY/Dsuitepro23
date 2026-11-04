@@ -349,43 +349,18 @@ class AuditLog(BaseModel):
         help_text="Whether this is a sensitive action requiring justification"
     )
     
-    # Outcome
-    outcome = models.CharField(
-        max_length=50,
-        default='success',
-        db_index=True,
-        help_text="Outcome of the action (success/failure/blocked)"
-    )
-    error_message = models.TextField(
-        blank=True,
-        help_text="Error message if action failed"
-    )
-    
-    # Request context
-    user_agent = models.TextField(
-        blank=True,
-        help_text="User agent string"
-    )
-    request_id = models.CharField(
+    # Session context
+    session_id = models.CharField(
         max_length=255,
         blank=True,
-        db_index=True,
-        help_text="Request correlation ID"
+        help_text="Session identifier"
     )
     
-    # Timing
+    # Timestamp
     timestamp = models.DateTimeField(
         default=timezone.now,
         db_index=True,
         help_text="When the action was performed"
-    )
-    
-    # Data retention
-    retention_until = models.DateTimeField(
-        null=True,
-        blank=True,
-        db_index=True,
-        help_text="Date when this record can be archived"
     )
     
     class Meta:
@@ -393,38 +368,25 @@ class AuditLog(BaseModel):
         verbose_name_plural = "Audit Logs"
         ordering = ['-timestamp']
         indexes = [
-            models.Index(fields=['actor', 'action', 'timestamp']),
+            models.Index(fields=['action', 'timestamp']),
             models.Index(fields=['resource_type', 'resource_id', 'timestamp']),
-            models.Index(fields=['action', 'outcome', 'timestamp']),
+            models.Index(fields=['actor', 'timestamp']),
             models.Index(fields=['is_sensitive', 'timestamp']),
-            models.Index(fields=['request_id', 'timestamp']),
         ]
     
     def __str__(self):
-        actor = self.actor_email or (self.actor.email if self.actor else 'System')
-        return f"{self.action} on {self.resource_type} by {actor}"
+        return f"{self.action} on {self.resource_type} by {self.actor_email}"
     
     def clean(self):
         """Validate that sensitive actions have justification."""
         from django.core.exceptions import ValidationError
         if self.is_sensitive and not self.justification:
-            raise ValidationError({
-                'justification': 'Justification is required for sensitive administrative actions.'
-            })
-    
-    def save(self, *args, **kwargs):
-        self.clean()
-        if not self.retention_until:
-            # Audit logs kept for 10 years
-            self.retention_until = timezone.now() + timedelta(days=10*365)
-        super().save(*args, **kwargs)
+            raise ValidationError("Sensitive actions require a justification.")
     
     @classmethod
-    def log_admin_action(cls, action, actor, resource_type, resource_id,
-                         resource_name='', changes=None, before_state=None,
-                         after_state=None, justification='', is_sensitive=False,
-                         outcome='success', error_message='', actor_ip=None,
-                         user_agent='', request_id=''):
+    def log_action(cls, action, actor, resource_type, resource_id, resource_name='',
+                   changes=None, before_state=None, after_state=None,
+                   justification='', is_sensitive=False, session_id='', actor_ip=None):
         """
         Factory method to create an audit log entry.
         """
@@ -434,72 +396,40 @@ class AuditLog(BaseModel):
         return cls.objects.create(
             action=action,
             actor=actor,
-            actor_email=actor.email if actor else 'system@lms.local',
+            actor_email=actor.email if actor else '',
             actor_ip=actor_ip,
             resource_type=resource_type,
-            resource_id=str(resource_id),
+            resource_id=resource_id,
             resource_name=resource_name,
             changes=changes,
             before_state=before_state,
             after_state=after_state,
             justification=justification,
             is_sensitive=is_sensitive,
-            outcome=outcome,
-            error_message=error_message,
-            user_agent=user_agent,
-            request_id=request_id,
+            session_id=session_id,
             timestamp=timezone.now()
         )
 
 
 class ReportJob(BaseModel):
     """
-    Async report generation job with secure delivery.
+    Background report generation job tracking.
     """
     
-    # Report configuration
+    # Report metadata
     report_type = models.CharField(
         max_length=50,
         choices=ReportType.choices,
-        help_text="Type of report to generate"
+        db_index=True,
+        help_text="Type of report being generated"
     )
     name = models.CharField(
         max_length=255,
-        help_text="Human-readable name for this report"
+        help_text="Human-readable report name"
     )
     description = models.TextField(
         blank=True,
-        help_text="Description of report contents"
-    )
-    
-    # Requester
-    requested_by = models.ForeignKey(
-        User,
-        on_delete=models.CASCADE,
-        related_name='report_jobs',
-        help_text="User who requested this report"
-    )
-    
-    # Report parameters
-    parameters = models.JSONField(
-        default=dict,
-        blank=True,
-        help_text="Report generation parameters"
-    )
-    filters = models.JSONField(
-        default=dict,
-        blank=True,
-        help_text="Filters applied to the report"
-    )
-    date_range_start = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text="Start of date range for report"
-    )
-    date_range_end = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text="End of date range for report"
+        help_text="Report description"
     )
     
     # Status tracking
@@ -508,65 +438,67 @@ class ReportJob(BaseModel):
         choices=ReportStatus.choices,
         default=ReportStatus.PENDING,
         db_index=True,
-        help_text="Current status of report generation"
-    )
-    progress_percent = models.IntegerField(
-        default=0,
-        help_text="Report generation progress (0-100)"
+        help_text="Current generation status"
     )
     
-    # Output
-    file_format = models.CharField(
-        max_length=10,
-        default='csv',
-        help_text="Output file format (csv, pdf, xlsx, json)"
+    # Request parameters
+    parameters = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Report generation parameters"
+    )
+    
+    # Result tracking
+    file_path = models.CharField(
+        max_length=500,
+        blank=True,
+        help_text="Path to generated report file"
     )
     file_size = models.BigIntegerField(
         null=True,
         blank=True,
         help_text="Size of generated file in bytes"
     )
-    file_url = models.URLField(
-        max_length=1000,
+    download_url = models.URLField(
         blank=True,
-        help_text="Secure download URL for the report"
+        help_text="Temporary download URL"
     )
     expires_at = models.DateTimeField(
         null=True,
         blank=True,
-        help_text="When the download link expires"
+        help_text="When the report expires"
     )
     
-    # Error handling
+    # Error tracking
     error_message = models.TextField(
         blank=True,
         help_text="Error message if generation failed"
     )
-    retry_count = models.IntegerField(
+    retry_count = models.PositiveIntegerField(
         default=0,
         help_text="Number of retry attempts"
+    )
+    
+    # Requester
+    requested_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='report_jobs',
+        help_text="User who requested the report"
     )
     
     # Timing
     started_at = models.DateTimeField(
         null=True,
         blank=True,
-        help_text="When report generation started"
+        help_text="When generation started"
     )
     completed_at = models.DateTimeField(
         null=True,
         blank=True,
-        help_text="When report generation completed"
-    )
-    
-    # Notification
-    notify_on_complete = models.BooleanField(
-        default=True,
-        help_text="Whether to notify user when complete"
-    )
-    notification_sent = models.BooleanField(
-        default=False,
-        help_text="Whether completion notification was sent"
+        help_text="When generation completed"
     )
     
     class Meta:
@@ -574,221 +506,202 @@ class ReportJob(BaseModel):
         verbose_name_plural = "Report Jobs"
         ordering = ['-created_at']
         indexes = [
-            models.Index(fields=['requested_by', 'status', 'created_at']),
-            models.Index(fields=['report_type', 'status', 'created_at']),
+            models.Index(fields=['report_type', 'status']),
+            models.Index(fields=['requested_by', 'status']),
             models.Index(fields=['status', 'created_at']),
-            models.Index(fields=['expires_at', 'status']),
         ]
     
     def __str__(self):
         return f"{self.name} ({self.status})"
     
     def mark_started(self):
-        """Mark report as started processing."""
+        """Mark the report as started."""
         self.status = ReportStatus.PROCESSING
         self.started_at = timezone.now()
         self.save(update_fields=['status', 'started_at', 'updated_at'])
     
-    def mark_completed(self, file_url='', file_size=0):
-        """Mark report as completed with download URL."""
+    def mark_completed(self, file_path='', file_size=None, download_url=''):
+        """Mark the report as completed."""
         self.status = ReportStatus.COMPLETED
-        self.progress_percent = 100
         self.completed_at = timezone.now()
-        self.file_url = file_url
+        self.file_path = file_path
         self.file_size = file_size
-        self.expires_at = timezone.now() + timedelta(days=7)
+        self.download_url = download_url
         self.save(update_fields=[
-            'status', 'progress_percent', 'completed_at',
-            'file_url', 'file_size', 'expires_at', 'updated_at'
+            'status', 'completed_at', 'file_path', 'file_size',
+            'download_url', 'updated_at'
         ])
     
     def mark_failed(self, error_message):
-        """Mark report as failed with error message."""
+        """Mark the report as failed."""
         self.status = ReportStatus.FAILED
         self.error_message = error_message
         self.completed_at = timezone.now()
         self.save(update_fields=['status', 'error_message', 'completed_at', 'updated_at'])
-    
-    def update_progress(self, percent):
-        """Update report generation progress."""
-        self.progress_percent = min(max(percent, 0), 100)
-        self.save(update_fields=['progress_percent', 'updated_at'])
-    
-    def is_expired(self):
-        """Check if the download link has expired."""
-        if self.expires_at:
-            return timezone.now() > self.expires_at
-        return False
-    
-    def can_download(self):
-        """Check if report is available for download."""
-        return (
-            self.status == ReportStatus.COMPLETED and
-            self.file_url and
-            not self.is_expired()
-        )
 
 
 class SecurityAuditLog(BaseModel):
     """
-    Tamper-evident security audit log for SOC 2 compliance.
-    Tracks all security events with hash chain integrity verification.
+    Security-focused audit log for compliance (SOC 2, ISO 27001).
+    Tracks authentication, authorization, and security events.
     """
     
-    # Event Categories
-    CATEGORY_AUTHN = 'authentication'
-    CATEGORY_AUTHZ = 'authorization'
-    CATEGORY_DATA_ACCESS = 'data_access'
-    CATEGORY_SYSTEM = 'system'
-    CATEGORY_IMPERSONATION = 'impersonation'
-    CATEGORY_SESSION = 'session'
-    
-    CATEGORY_CHOICES = [
-        (CATEGORY_AUTHN, 'Authentication'),
-        (CATEGORY_AUTHZ, 'Authorization'),
-        (CATEGORY_DATA_ACCESS, 'Data Access'),
-        (CATEGORY_SYSTEM, 'System'),
-        (CATEGORY_IMPERSONATION, 'Impersonation'),
-        (CATEGORY_SESSION, 'Session Management'),
-    ]
-    
-    # Severity Levels
-    SEVERITY_INFO = 'info'
-    SEVERITY_WARNING = 'warning'
+    # Event classification
+    SEVERITY_LOW = 'low'
+    SEVERITY_MEDIUM = 'medium'
+    SEVERITY_HIGH = 'high'
     SEVERITY_CRITICAL = 'critical'
     
     SEVERITY_CHOICES = [
-        (SEVERITY_INFO, 'Info'),
-        (SEVERITY_WARNING, 'Warning'),
+        (SEVERITY_LOW, 'Low'),
+        (SEVERITY_MEDIUM, 'Medium'),
+        (SEVERITY_HIGH, 'High'),
         (SEVERITY_CRITICAL, 'Critical'),
     ]
     
-    # Event Types
     EVENT_LOGIN_SUCCESS = 'login_success'
     EVENT_LOGIN_FAILURE = 'login_failure'
     EVENT_LOGOUT = 'logout'
     EVENT_TOKEN_REFRESH = 'token_refresh'
-    EVENT_MFA_CHALLENGE = 'mfa_challenge'
-    EVENT_MFA_SUCCESS = 'mfa_success'
-    EVENT_MFA_FAILURE = 'mfa_failure'
     EVENT_ACCESS_DENIED = 'access_denied'
-    EVENT_ACCESS_GRANTED = 'access_granted'
-    EVENT_BULK_EXPORT = 'bulk_export'
-    EVENT_PII_QUERY = 'pii_query'
-    EVENT_IMPERSONATION_START = 'impersonation_start'
-    EVENT_IMPERSONATION_END = 'impersonation_end'
-    EVENT_SESSION_CREATED = 'session_created'
-    EVENT_SESSION_REVOKED = 'session_revoked'
-    EVENT_SESSION_EXPIRED = 'session_expired'
+    EVENT_PERMISSION_CHANGE = 'permission_change'
+    EVENT_DATA_EXPORT = 'data_export'
+    EVENT_BULK_OPERATION = 'bulk_operation'
+    EVENT_SUSPICIOUS_ACTIVITY = 'suspicious_activity'
+    EVENT_MFA_ENABLED = 'mfa_enabled'
+    EVENT_MFA_DISABLED = 'mfa_disabled'
     EVENT_PASSWORD_CHANGE = 'password_change'
     EVENT_PASSWORD_RESET = 'password_reset'
-    EVENT_ROLE_ASSIGNED = 'role_assigned'
-    EVENT_ROLE_REVOKED = 'role_revoked'
+    EVENT_SESSION_REVOKED = 'session_revoked'
+    EVENT_API_KEY_CREATED = 'api_key_created'
+    EVENT_API_KEY_REVOKED = 'api_key_revoked'
+    
+    EVENT_CHOICES = [
+        (EVENT_LOGIN_SUCCESS, 'Login Success'),
+        (EVENT_LOGIN_FAILURE, 'Login Failure'),
+        (EVENT_LOGOUT, 'Logout'),
+        (EVENT_TOKEN_REFRESH, 'Token Refresh'),
+        (EVENT_ACCESS_DENIED, 'Access Denied'),
+        (EVENT_PERMISSION_CHANGE, 'Permission Change'),
+        (EVENT_DATA_EXPORT, 'Data Export'),
+        (EVENT_BULK_OPERATION, 'Bulk Operation'),
+        (EVENT_SUSPICIOUS_ACTIVITY, 'Suspicious Activity'),
+        (EVENT_MFA_ENABLED, 'MFA Enabled'),
+        (EVENT_MFA_DISABLED, 'MFA Disabled'),
+        (EVENT_PASSWORD_CHANGE, 'Password Change'),
+        (EVENT_PASSWORD_RESET, 'Password Reset'),
+        (EVENT_SESSION_REVOKED, 'Session Revoked'),
+        (EVENT_API_KEY_CREATED, 'API Key Created'),
+        (EVENT_API_KEY_REVOKED, 'API Key Revoked'),
+    ]
     
     event_type = models.CharField(
         max_length=50,
+        choices=EVENT_CHOICES,
+        db_index=True,
         help_text="Type of security event"
-    )
-    event_category = models.CharField(
-        max_length=50,
-        choices=CATEGORY_CHOICES,
-        default=CATEGORY_SYSTEM,
-        help_text="Category of the security event"
     )
     severity = models.CharField(
         max_length=20,
         choices=SEVERITY_CHOICES,
-        default=SEVERITY_INFO,
-        help_text="Severity level of the event"
+        default=SEVERITY_LOW,
+        db_index=True,
+        help_text="Event severity level"
     )
     
-    # Actor Information
-    actor_user = models.ForeignKey(
+    # Actor information
+    actor = models.ForeignKey(
         User,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name='security_audit_logs',
-        help_text="User who performed the action"
+        related_name='security_events',
+        help_text="User associated with the event"
     )
     actor_email = models.EmailField(
         blank=True,
-        help_text="Email of the actor (for deleted users)"
+        db_index=True,
+        help_text="Email of actor (preserved for deleted users)"
     )
-    
-    # Target Information
-    target_resource = models.CharField(
-        max_length=255,
-        blank=True,
-        help_text="Resource being accessed or modified"
-    )
-    target_resource_id = models.CharField(
-        max_length=255,
-        blank=True,
-        help_text="ID of the target resource"
-    )
-    
-    # Event Details
-    outcome = models.CharField(
+    actor_role = models.CharField(
         max_length=50,
-        help_text="Outcome of the event (success/failure/blocked)"
-    )
-    reason = models.TextField(
         blank=True,
-        help_text="Reason for the outcome (e.g., permission denied)"
+        help_text="Role of actor at time of event"
     )
-    details = models.JSONField(
+    
+    # Event details
+    description = models.TextField(
+        help_text="Human-readable event description"
+    )
+    metadata = models.JSONField(
         default=dict,
         blank=True,
-        help_text="Additional event details"
+        help_text="Additional event metadata"
     )
     
-    # Request Context
+    # Request context
     ip_address = models.GenericIPAddressField(
         null=True,
         blank=True,
-        help_text="IP address of the request"
+        db_index=True,
+        help_text="IP address"
     )
     user_agent = models.TextField(
         blank=True,
         help_text="User agent string"
-    )
-    request_method = models.CharField(
-        max_length=10,
-        blank=True,
-        help_text="HTTP method"
     )
     request_path = models.CharField(
         max_length=500,
         blank=True,
         help_text="Request path"
     )
+    session_id = models.CharField(
+        max_length=255,
+        blank=True,
+        db_index=True,
+        help_text="Session identifier"
+    )
     
-    # Timing
+    # Geographic info (for anomaly detection)
+    country_code = models.CharField(
+        max_length=2,
+        blank=True,
+        help_text="ISO country code"
+    )
+    city = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="City name"
+    )
+    
+    # Risk scoring
+    risk_score = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Calculated risk score (0-100)"
+    )
+    is_anomaly = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="Whether this event was flagged as anomalous"
+    )
+    
+    # Alert status
+    alert_sent = models.BooleanField(
+        default=False,
+        help_text="Whether an alert was sent for this event"
+    )
+    alert_sent_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When alert was sent"
+    )
+    
+    # Timestamp
     timestamp = models.DateTimeField(
         default=timezone.now,
         db_index=True,
         help_text="When the event occurred"
-    )
-    response_time_ms = models.IntegerField(
-        null=True,
-        blank=True,
-        help_text="Response time in milliseconds"
-    )
-    
-    # Tamper-evident Hash Chain
-    previous_hash = models.CharField(
-        max_length=64,
-        blank=True,
-        help_text="Hash of the previous log entry"
-    )
-    current_hash = models.CharField(
-        max_length=64,
-        help_text="Hash of this log entry"
-    )
-    hash_verified = models.BooleanField(
-        default=False,
-        help_text="Whether the hash chain has been verified"
     )
     
     class Meta:
@@ -796,464 +709,952 @@ class SecurityAuditLog(BaseModel):
         verbose_name_plural = "Security Audit Logs"
         ordering = ['-timestamp']
         indexes = [
-            models.Index(fields=['event_category', 'severity', 'timestamp']),
-            models.Index(fields=['actor_user', 'timestamp']),
-            models.Index(fields=['event_type', 'timestamp']),
+            models.Index(fields=['event_type', 'severity', 'timestamp']),
+            models.Index(fields=['actor', 'event_type', 'timestamp']),
             models.Index(fields=['ip_address', 'timestamp']),
-            models.Index(fields=['outcome', 'timestamp']),
+            models.Index(fields=['is_anomaly', 'timestamp']),
+            models.Index(fields=['severity', 'is_anomaly', 'timestamp']),
         ]
     
     def __str__(self):
-        actor = self.actor_email or (self.actor_user.email if self.actor_user else 'Anonymous')
-        return f"{self.event_type} by {actor} at {self.timestamp}"
-    
-    def calculate_hash(self):
-        """
-        Calculate SHA-256 hash of this log entry.
-        Includes all fields except current_hash and hash_verified.
-        """
-        data = {
-            'event_type': self.event_type,
-            'event_category': self.event_category,
-            'severity': self.severity,
-            'actor_user_id': str(self.actor_user_id) if self.actor_user_id else None,
-            'actor_email': self.actor_email,
-            'target_resource': self.target_resource,
-            'target_resource_id': self.target_resource_id,
-            'outcome': self.outcome,
-            'reason': self.reason,
-            'details': self.details,
-            'ip_address': str(self.ip_address) if self.ip_address else None,
-            'user_agent': self.user_agent,
-            'request_method': self.request_method,
-            'request_path': self.request_path,
-            'timestamp': self.timestamp.isoformat() if self.timestamp else None,
-            'response_time_ms': self.response_time_ms,
-            'previous_hash': self.previous_hash,
-        }
-        
-        # Sort keys for consistent hashing
-        json_data = json.dumps(data, sort_keys=True, default=str)
-        return hashlib.sha256(json_data.encode('utf-8')).hexdigest()
-    
-    def save(self, *args, **kwargs):
-        """
-        Override save to compute hash chain.
-        """
-        # Get previous hash if this is a new entry
-        if not self.pk:
-            try:
-                previous_log = SecurityAuditLog.objects.order_by('-timestamp').first()
-                self.previous_hash = previous_log.current_hash if previous_log else '0' * 64
-            except Exception:
-                self.previous_hash = '0' * 64
-        
-        # Calculate current hash before saving
-        self.current_hash = self.calculate_hash()
-        
-        super().save(*args, **kwargs)
-    
-    def verify_integrity(self):
-        """
-        Verify the integrity of this log entry.
-        Returns True if the hash matches the calculated value.
-        """
-        expected_hash = self.calculate_hash()
-        return self.current_hash == expected_hash
+        return f"{self.event_type} ({self.severity}) at {self.timestamp}"
     
     @classmethod
-    def verify_chain_integrity(cls, start_from=None):
-        """
-        Verify the integrity of the entire hash chain.
-        Returns a tuple (is_valid, broken_at_id) where broken_at_id is the
-        ID of the first log entry with a broken chain, or None if valid.
-        """
-        queryset = cls.objects.all().order_by('timestamp')
-        if start_from:
-            queryset = queryset.filter(timestamp__gte=start_from)
-        
-        previous_hash = '0' * 64
-        
-        for log in queryset:
-            # Verify current hash
-            if not log.verify_integrity():
-                return False, log.id
-            
-            # Verify chain link
-            if log.previous_hash != previous_hash:
-                return False, log.id
-            
-            previous_hash = log.current_hash
-        
-        return True, None
-    
-    @classmethod
-    def log_event(cls, event_type, event_category, severity, actor_user=None,
-                  actor_email='', target_resource='', target_resource_id='',
-                  outcome='success', reason='', details=None, ip_address=None,
-                  user_agent='', request_method='', request_path='',
-                  response_time_ms=None):
+    def log_security_event(cls, event_type, severity=SEVERITY_LOW, actor=None,
+                          description='', metadata=None, ip_address=None,
+                          user_agent='', request_path='', session_id='',
+                          risk_score=None, is_anomaly=False):
         """
         Factory method to create a security audit log entry.
         """
-        if details is None:
-            details = {}
+        if metadata is None:
+            metadata = {}
         
         return cls.objects.create(
             event_type=event_type,
-            event_category=event_category,
             severity=severity,
-            actor_user=actor_user,
-            actor_email=actor_email or (actor_user.email if actor_user else ''),
-            target_resource=target_resource,
-            target_resource_id=target_resource_id,
-            outcome=outcome,
-            reason=reason,
-            details=details,
+            actor=actor,
+            actor_email=actor.email if actor else '',
+            actor_role=actor.role if actor and hasattr(actor, 'role') else '',
+            description=description,
+            metadata=metadata,
             ip_address=ip_address,
             user_agent=user_agent,
-            request_method=request_method,
             request_path=request_path,
-            timestamp=timezone.now(),
-            response_time_ms=response_time_ms
+            session_id=session_id,
+            risk_score=risk_score,
+            is_anomaly=is_anomaly,
+            timestamp=timezone.now()
         )
 
 
-class AuditLogExport(BaseModel):
+# =============================================================================
+# LRS (Learning Record Store) Integration Models
+# =============================================================================
+
+class LRSType(models.TextChoices):
+    """Types of Learning Record Store endpoints."""
+    SCORM_CLOUD = 'scorm_cloud', 'SCORM Cloud'
+    CUSTOM_LRS = 'custom_lrs', 'Custom LRS'
+    WATERSHED = 'watershed', 'Watershed LRS'
+    LEARNING_LOCKER = 'learning_locker', 'Learning Locker'
+    VERACITY = 'veracity', 'Veracity LRS'
+    OTHER = 'other', 'Other'
+
+
+class LRSSyncMode(models.TextChoices):
+    """Synchronization modes for LRS."""
+    PUSH = 'push', 'Push (Send to LRS)'
+    PULL = 'pull', 'Pull (Receive from LRS)'
+    BIDIRECTIONAL = 'bidirectional', 'Bidirectional'
+
+
+class LRSCredentialType(models.TextChoices):
+    """Authentication credential types for LRS."""
+    BASIC_AUTH = 'basic_auth', 'Basic Authentication'
+    OAUTH2 = 'oauth2', 'OAuth 2.0'
+    API_KEY = 'api_key', 'API Key'
+    SAML = 'saml', 'SAML Assertion'
+
+
+class LRSConfiguration(BaseModel):
     """
-    Export job for audit logs with compliance controls.
+    Configuration for external Learning Record Store (LRS) endpoints.
+    Supports SCORM Cloud, Watershed, Learning Locker, and custom LRS implementations.
     """
     
-    EXPORT_FORMAT_CHOICES = [
-        ('json', 'JSON'),
-        ('csv', 'CSV'),
-        ('pdf', 'PDF'),
-    ]
-    
-    EXPORT_STATUS_CHOICES = [
-        ('pending', 'Pending'),
-        ('processing', 'Processing'),
-        ('completed', 'Completed'),
-        ('failed', 'Failed'),
-    ]
-    
-    # Export configuration
-    start_date = models.DateTimeField(
-        help_text="Start date for export range"
+    # Basic Information
+    name = models.CharField(
+        max_length=255,
+        help_text="Human-readable name for this LRS configuration"
     )
-    end_date = models.DateTimeField(
-        help_text="End date for export range"
-    )
-    event_categories = models.JSONField(
-        default=list,
+    description = models.TextField(
         blank=True,
-        help_text="Filter by event categories"
+        help_text="Description of this LRS configuration"
     )
-    severity_levels = models.JSONField(
-        default=list,
+    
+    # LRS Type
+    lrs_type = models.CharField(
+        max_length=50,
+        choices=LRSType.choices,
+        default=LRSType.CUSTOM_LRS,
+        db_index=True,
+        help_text="Type of LRS endpoint"
+    )
+    
+    # Endpoint Configuration
+    endpoint_url = models.URLField(
+        help_text="LRS endpoint URL (e.g., https://lrs.example.com/xAPI/)"
+    )
+    statement_endpoint = models.URLField(
         blank=True,
-        help_text="Filter by severity levels"
+        help_text="Optional: Specific statements endpoint if different from base"
     )
     
-    # Requester
-    requested_by = models.ForeignKey(
-        User,
-        on_delete=models.CASCADE,
-        related_name='audit_exports',
-        help_text="User who requested this export"
+    # Authentication Credentials (encrypted at rest)
+    credential_type = models.CharField(
+        max_length=50,
+        choices=LRSCredentialType.choices,
+        default=LRSCredentialType.BASIC_AUTH,
+        help_text="Authentication method"
     )
     
-    # Export settings
-    format = models.CharField(
-        max_length=10,
-        choices=EXPORT_FORMAT_CHOICES,
-        default='json',
-        help_text="Export file format"
+    # For Basic Auth / API Key
+    api_key = models.CharField(
+        max_length=500,
+        blank=True,
+        help_text="API Key or Basic Auth username (encrypted)"
     )
-    include_verification = models.BooleanField(
-        default=True,
-        help_text="Include hash chain verification in export"
+    api_secret = models.CharField(
+        max_length=500,
+        blank=True,
+        help_text="API Secret or Basic Auth password (encrypted)"
     )
     
-    # Status
-    status = models.CharField(
+    # For OAuth 2.0
+    oauth_client_id = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="OAuth 2.0 Client ID"
+    )
+    oauth_client_secret = models.CharField(
+        max_length=500,
+        blank=True,
+        help_text="OAuth 2.0 Client Secret (encrypted)"
+    )
+    oauth_token_url = models.URLField(
+        blank=True,
+        help_text="OAuth 2.0 Token Endpoint"
+    )
+    oauth_access_token = models.TextField(
+        blank=True,
+        help_text="Cached OAuth Access Token (encrypted)"
+    )
+    oauth_token_expires_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="OAuth Token Expiration Time"
+    )
+    oauth_scope = models.CharField(
+        max_length=255,
+        blank=True,
+        default='statements/write statements/read',
+        help_text="OAuth Scope"
+    )
+    
+    # Sync Configuration
+    sync_mode = models.CharField(
         max_length=20,
-        choices=EXPORT_STATUS_CHOICES,
-        default='pending',
-        help_text="Current export status"
+        choices=LRSSyncMode.choices,
+        default=LRSSyncMode.PUSH,
+        help_text="Synchronization mode"
+    )
+    is_active = models.BooleanField(
+        default=True,
+        db_index=True,
+        help_text="Whether this LRS is active"
+    )
+    is_primary = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="Primary LRS for statement forwarding"
     )
     
-    # Output
-    file = models.FileField(
-        upload_to='audit_exports/%Y/%m/',
-        null=True,
-        blank=True,
-        help_text="Exported audit log file"
+    # Batch Processing
+    batch_size = models.PositiveIntegerField(
+        default=100,
+        help_text="Number of statements to batch per request"
     )
-    record_count = models.IntegerField(
-        null=True,
-        blank=True,
-        help_text="Number of records exported"
+    batch_interval_minutes = models.PositiveIntegerField(
+        default=5,
+        help_text="Minutes between batch sync attempts"
     )
     
-    # Compliance
-    justification = models.TextField(
-        help_text="Business justification for this export"
+    # Retry Configuration
+    max_retries = models.PositiveIntegerField(
+        default=3,
+        help_text="Maximum retry attempts for failed statements"
     )
-    approved_by = models.ForeignKey(
+    retry_delay_seconds = models.PositiveIntegerField(
+        default=60,
+        help_text="Delay between retry attempts in seconds"
+    )
+    
+    # Statement Filtering
+    statement_filter = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="JSON filter for which statements to forward (e.g., {'verb': ['completed', 'passed']})"
+    )
+    include_attachments = models.BooleanField(
+        default=False,
+        help_text="Whether to include attachments in forwarded statements"
+    )
+    
+    # SCORM Cloud Specific
+    scorm_cloud_app_id = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="SCORM Cloud Application ID"
+    )
+    scorm_cloud_region = models.CharField(
+        max_length=50,
+        blank=True,
+        default='US',
+        help_text="SCORM Cloud Region (US, EU, AU, CA)"
+    )
+    
+    # Health Check
+    last_synced_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Last successful sync timestamp"
+    )
+    last_sync_status = models.CharField(
+        max_length=20,
+        blank=True,
+        help_text="Status of last sync attempt"
+    )
+    last_error_message = models.TextField(
+        blank=True,
+        help_text="Last error message if sync failed"
+    )
+    consecutive_failures = models.PositiveIntegerField(
+        default=0,
+        help_text="Count of consecutive sync failures"
+    )
+    
+    # Version Info
+    xapi_version = models.CharField(
+        max_length=10,
+        default='1.0.3',
+        help_text="xAPI version supported"
+    )
+    
+    # Ownership
+    created_by = models.ForeignKey(
         User,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name='approved_audit_exports',
-        help_text="Administrator who approved this export"
-    )
-    approved_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text="When the export was approved"
+        related_name='lrs_configurations',
+        help_text="User who created this configuration"
     )
     
     class Meta:
-        verbose_name = "Audit Log Export"
-        verbose_name_plural = "Audit Log Exports"
-        ordering = ['-created_at']
+        verbose_name = "LRS Configuration"
+        verbose_name_plural = "LRS Configurations"
+        ordering = ['-is_primary', 'name']
+        indexes = [
+            models.Index(fields=['lrs_type', 'is_active']),
+            models.Index(fields=['is_primary', 'is_active']),
+            models.Index(fields=['sync_mode', 'is_active']),
+        ]
     
     def __str__(self):
-        return f"Export {self.start_date} to {self.end_date} ({self.status})"
+        return f"{self.name} ({self.lrs_type})"
+    
+    def mark_sync_success(self):
+        """Mark the last sync as successful."""
+        self.last_synced_at = timezone.now()
+        self.last_sync_status = 'success'
+        self.consecutive_failures = 0
+        self.save(update_fields=['last_synced_at', 'last_sync_status', 'consecutive_failures', 'updated_at'])
+    
+    def mark_sync_failure(self, error_message):
+        """Mark the last sync as failed."""
+        self.last_sync_status = 'failed'
+        self.last_error_message = error_message[:1000]  # Limit length
+        self.consecutive_failures += 1
+        self.save(update_fields=['last_sync_status', 'last_error_message', 'consecutive_failures', 'updated_at'])
+    
+    def is_healthy(self):
+        """Check if LRS is healthy (not too many consecutive failures)."""
+        return self.consecutive_failures < self.max_retries
+    
+    def should_sync(self):
+        """Check if LRS should be synced based on interval."""
+        if not self.last_synced_at:
+            return True
+        next_sync = self.last_synced_at + timedelta(minutes=self.batch_interval_minutes)
+        return timezone.now() >= next_sync
 
 
-class ABTestCampaign(BaseModel):
+class xAPIStatementStatus(models.TextChoices):
+    """Delivery status for xAPI statements."""
+    PENDING = 'pending', 'Pending'
+    QUEUED = 'queued', 'Queued'
+    SENDING = 'sending', 'Sending'
+    DELIVERED = 'delivered', 'Delivered'
+    FAILED = 'failed', 'Failed'
+    RETRYING = 'retrying', 'Retrying'
+    EXPIRED = 'expired', 'Expired'
+
+
+class xAPIStatement(BaseModel):
     """
-    A/B test campaign for analytics experiments.
+    xAPI statement for forwarding to external LRS.
+    Tracks delivery status and retry attempts.
     """
     
-    STATUS_CHOICES = [
-        ('draft', 'Draft'),
-        ('running', 'Running'),
-        ('paused', 'Paused'),
-        ('completed', 'Completed'),
-        ('cancelled', 'Cancelled'),
-    ]
+    # Statement Identification
+    statement_id = models.UUIDField(
+        default=uuid.uuid4,
+        unique=True,
+        editable=False,
+        db_index=True,
+        help_text="Unique xAPI statement ID"
+    )
     
+    # Target LRS
+    target_lrs = models.ForeignKey(
+        LRSConfiguration,
+        on_delete=models.CASCADE,
+        related_name='statements',
+        help_text="Target LRS for this statement"
+    )
+    
+    # Statement Content
+    statement = models.JSONField(
+        help_text="Complete xAPI statement JSON"
+    )
+    verb = models.CharField(
+        max_length=255,
+        db_index=True,
+        help_text="xAPI verb ID"
+    )
+    actor_email = models.EmailField(
+        blank=True,
+        db_index=True,
+        help_text="Actor email for filtering"
+    )
+    activity_id = models.CharField(
+        max_length=500,
+        blank=True,
+        db_index=True,
+        help_text="Activity ID"
+    )
+    timestamp = models.DateTimeField(
+        db_index=True,
+        help_text="Statement timestamp"
+    )
+    
+    # Delivery Status
+    status = models.CharField(
+        max_length=20,
+        choices=xAPIStatementStatus.choices,
+        default=xAPIStatementStatus.PENDING,
+        db_index=True,
+        help_text="Delivery status"
+    )
+    
+    # Retry Tracking
+    retry_count = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of delivery attempts"
+    )
+    last_retry_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Last retry timestamp"
+    )
+    next_retry_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Next scheduled retry"
+    )
+    
+    # Response Tracking
+    lrs_response_code = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="HTTP response code from LRS"
+    )
+    lrs_response_body = models.TextField(
+        blank=True,
+        help_text="Response body from LRS"
+    )
+    error_message = models.TextField(
+        blank=True,
+        help_text="Error message if delivery failed"
+    )
+    
+    # Delivery Confirmation
+    delivered_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When statement was successfully delivered"
+    )
+    confirmed_by_lrs = models.BooleanField(
+        default=False,
+        help_text="Whether LRS confirmed receipt"
+    )
+    
+    # Source Information
+    source = models.CharField(
+        max_length=50,
+        default='internal',
+        help_text="Source of statement (internal, scorm, import, etc.)"
+    )
+    source_id = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="ID of source record (e.g., SCORM registration ID)"
+    )
+    
+    # Expiration
+    expires_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="When this statement expires and can be deleted"
+    )
+    
+    class Meta:
+        verbose_name = "xAPI Statement"
+        verbose_name_plural = "xAPI Statements"
+        ordering = ['-timestamp']
+        indexes = [
+            models.Index(fields=['target_lrs', 'status', 'timestamp']),
+            models.Index(fields=['status', 'next_retry_at']),
+            models.Index(fields=['verb', 'status']),
+            models.Index(fields=['actor_email', 'timestamp']),
+            models.Index(fields=['activity_id', 'timestamp']),
+            models.Index(fields=['source', 'source_id']),
+        ]
+    
+    def __str__(self):
+        return f"Statement {self.statement_id} ({self.status})"
+    
+    def mark_delivered(self, response_code=None, response_body=''):
+        """Mark statement as successfully delivered."""
+        self.status = xAPIStatementStatus.DELIVERED
+        self.delivered_at = timezone.now()
+        self.lrs_response_code = response_code
+        self.lrs_response_body = response_body[:1000]  # Limit length
+        self.confirmed_by_lrs = True
+        self.save(update_fields=[
+            'status', 'delivered_at', 'lrs_response_code',
+            'lrs_response_body', 'confirmed_by_lrs', 'updated_at'
+        ])
+    
+    def mark_failed(self, error_message, response_code=None):
+        """Mark statement as failed."""
+        self.status = xAPIStatementStatus.FAILED
+        self.error_message = error_message[:1000]
+        self.lrs_response_code = response_code
+        self.save(update_fields=['status', 'error_message', 'lrs_response_code', 'updated_at'])
+    
+    def schedule_retry(self, delay_minutes=5):
+        """Schedule a retry attempt."""
+        self.retry_count += 1
+        self.last_retry_at = timezone.now()
+        self.next_retry_at = timezone.now() + timedelta(minutes=delay_minutes)
+        self.status = xAPIStatementStatus.RETRYING
+        self.save(update_fields=['retry_count', 'last_retry_at', 'next_retry_at', 'status', 'updated_at'])
+    
+    def should_retry(self, max_retries=3):
+        """Check if statement should be retried."""
+        if self.retry_count >= max_retries:
+            return False
+        if self.next_retry_at and timezone.now() < self.next_retry_at:
+            return False
+        return self.status in [xAPIStatementStatus.PENDING, xAPIStatementStatus.FAILED, xAPIStatementStatus.RETRYING]
+
+
+class LearningRecordAggregation(BaseModel):
+    """
+    Aggregated learning records from multiple LRS sources.
+    Provides unified view for cross-platform analytics.
+    """
+    
+    # Record Identification
+    record_id = models.UUIDField(
+        default=uuid.uuid4,
+        unique=True,
+        editable=False,
+        help_text="Unique aggregation record ID"
+    )
+    
+    # Source Information
+    source_lrs = models.ForeignKey(
+        LRSConfiguration,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='aggregated_records',
+        help_text="Source LRS (null for internal records)"
+    )
+    source_statement_id = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="Original statement ID from source LRS"
+    )
+    
+    # Actor Information
+    user = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='learning_records',
+        help_text="User associated with this record"
+    )
+    actor_identifier = models.CharField(
+        max_length=255,
+        db_index=True,
+        help_text="Actor identifier (email or account)"
+    )
+    actor_name = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="Actor display name"
+    )
+    
+    # Activity Information
+    activity_id = models.CharField(
+        max_length=500,
+        db_index=True,
+        help_text="Activity ID (URI)"
+    )
+    activity_name = models.CharField(
+        max_length=500,
+        blank=True,
+        help_text="Activity display name"
+    )
+    activity_type = models.CharField(
+        max_length=255,
+        blank=True,
+        db_index=True,
+        help_text="Activity type URI"
+    )
+    
+    # Verb Information
+    verb_id = models.CharField(
+        max_length=255,
+        db_index=True,
+        help_text="Verb ID (URI)"
+    )
+    verb_display = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Verb display name"
+    )
+    
+    # Result Information
+    result_success = models.BooleanField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Whether the activity was successful"
+    )
+    result_completion = models.BooleanField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Whether the activity was completed"
+    )
+    result_score_raw = models.DecimalField(
+        max_digits=10,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        help_text="Raw score"
+    )
+    result_score_scaled = models.DecimalField(
+        max_digits=5,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        help_text="Scaled score (0-1)"
+    )
+    result_duration = models.DurationField(
+        null=True,
+        blank=True,
+        help_text="Activity duration"
+    )
+    result_response = models.TextField(
+        blank=True,
+        help_text="Learner response"
+    )
+    
+    # Context Information
+    context_registration = models.UUIDField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Registration UUID from context"
+    )
+    context_platform = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Platform from context"
+    )
+    
+    # Timestamps
+    statement_timestamp = models.DateTimeField(
+        db_index=True,
+        help_text="Original statement timestamp"
+    )
+    stored_timestamp = models.DateTimeField(
+        db_index=True,
+        help_text="When statement was stored in source LRS"
+    )
+    
+    # Full Statement
+    full_statement = models.JSONField(
+        help_text="Complete xAPI statement"
+    )
+    
+    # Conflict Resolution
+    is_conflict_resolved = models.BooleanField(
+        default=True,
+        help_text="Whether any conflicts have been resolved"
+    )
+    conflict_resolution_notes = models.TextField(
+        blank=True,
+        help_text="Notes on conflict resolution"
+    )
+    
+    class Meta:
+        verbose_name = "Learning Record Aggregation"
+        verbose_name_plural = "Learning Record Aggregations"
+        ordering = ['-statement_timestamp']
+        indexes = [
+            models.Index(fields=['user', 'statement_timestamp']),
+            models.Index(fields=['actor_identifier', 'statement_timestamp']),
+            models.Index(fields=['activity_id', 'statement_timestamp']),
+            models.Index(fields=['verb_id', 'statement_timestamp']),
+            models.Index(fields=['result_success', 'statement_timestamp']),
+            models.Index(fields=['result_completion', 'statement_timestamp']),
+            models.Index(fields=['context_registration', 'statement_timestamp']),
+            models.Index(fields=['source_lrs', 'statement_timestamp']),
+        ]
+        unique_together = [
+            ('source_lrs', 'source_statement_id'),
+        ]
+    
+    def __str__(self):
+        return f"{self.actor_identifier} {self.verb_display} {self.activity_name}"
+
+
+class LRSFederationRule(BaseModel):
+    """
+    Rules for federating statements between LRS instances.
+    Supports complex routing and filtering scenarios.
+    """
+    
+    # Rule Information
     name = models.CharField(
         max_length=255,
-        help_text="Campaign name"
+        help_text="Rule name"
     )
     description = models.TextField(
         blank=True,
-        help_text="Campaign description"
+        help_text="Rule description"
     )
-    hypothesis = models.TextField(
-        blank=True,
-        help_text="Test hypothesis"
+    is_active = models.BooleanField(
+        default=True,
+        db_index=True,
+        help_text="Whether this rule is active"
+    )
+    priority = models.PositiveIntegerField(
+        default=100,
+        help_text="Rule priority (lower = higher priority)"
     )
     
-    # Targeting
-    target_segment = models.JSONField(
+    # Source LRS (null = internal system)
+    source_lrs = models.ForeignKey(
+        LRSConfiguration,
+        on_delete=models.CASCADE,
+        related_name='federation_source_rules',
+        null=True,
+        blank=True,
+        help_text="Source LRS (null for internal statements)"
+    )
+    
+    # Target LRS
+    target_lrs = models.ForeignKey(
+        LRSConfiguration,
+        on_delete=models.CASCADE,
+        related_name='federation_target_rules',
+        help_text="Target LRS for forwarded statements"
+    )
+    
+    # Filter Conditions (JSON Logic)
+    filter_conditions = models.JSONField(
         default=dict,
         blank=True,
-        help_text="User segment criteria"
-    )
-    traffic_allocation = models.IntegerField(
-        default=100,
-        help_text="Percentage of traffic to include"
+        help_text="JSON filter conditions (e.g., {'verb': ['completed'], 'actor.email': ['*@example.com']})"
     )
     
-    # Timing
-    start_date = models.DateTimeField(
-        null=True,
+    # Transformation Rules
+    transform_rules = models.JSONField(
+        default=dict,
         blank=True,
-        help_text="When the campaign starts"
-    )
-    end_date = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text="When the campaign ends"
+        help_text="JSON transformation rules for statement modification"
     )
     
-    # Status
+    # Rate Limiting
+    rate_limit_per_minute = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Maximum statements per minute (null = unlimited)"
+    )
+    
+    # Statistics
+    statements_forwarded = models.PositiveBigIntegerField(
+        default=0,
+        help_text="Count of statements forwarded by this rule"
+    )
+    statements_filtered = models.PositiveBigIntegerField(
+        default=0,
+        help_text="Count of statements filtered by this rule"
+    )
+    last_triggered_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Last time this rule was triggered"
+    )
+    
+    class Meta:
+        verbose_name = "LRS Federation Rule"
+        verbose_name_plural = "LRS Federation Rules"
+        ordering = ['priority', 'name']
+        indexes = [
+            models.Index(fields=['is_active', 'priority']),
+            models.Index(fields=['source_lrs', 'target_lrs']),
+        ]
+    
+    def __str__(self):
+        source = self.source_lrs.name if self.source_lrs else 'Internal'
+        return f"{source} → {self.target_lrs.name} ({self.name})"
+    
+    def increment_forwarded(self):
+        """Increment forwarded count."""
+        self.statements_forwarded += 1
+        self.last_triggered_at = timezone.now()
+        self.save(update_fields=['statements_forwarded', 'last_triggered_at', 'updated_at'])
+    
+    def increment_filtered(self):
+        """Increment filtered count."""
+        self.statements_filtered += 1
+        self.last_triggered_at = timezone.now()
+        self.save(update_fields=['statements_filtered', 'last_triggered_at', 'updated_at'])
+
+
+class SCORMCloudSyncLog(BaseModel):
+    """
+    Synchronization log for SCORM Cloud integration.
+    Tracks content hosting, registration sync, and progress updates.
+    """
+    
+    SYNC_TYPE_CONTENT_UPLOAD = 'content_upload'
+    SYNC_TYPE_REGISTRATION_CREATE = 'registration_create'
+    SYNC_TYPE_PROGRESS_SYNC = 'progress_sync'
+    SYNC_TYPE_STATEMENT_FORWARD = 'statement_forward'
+    SYNC_TYPE_COURSE_IMPORT = 'course_import'
+    
+    SYNC_TYPE_CHOICES = [
+        (SYNC_TYPE_CONTENT_UPLOAD, 'Content Upload'),
+        (SYNC_TYPE_REGISTRATION_CREATE, 'Registration Create'),
+        (SYNC_TYPE_PROGRESS_SYNC, 'Progress Sync'),
+        (SYNC_TYPE_STATEMENT_FORWARD, 'Statement Forward'),
+        (SYNC_TYPE_COURSE_IMPORT, 'Course Import'),
+    ]
+    
+    STATUS_PENDING = 'pending'
+    STATUS_IN_PROGRESS = 'in_progress'
+    STATUS_SUCCESS = 'success'
+    STATUS_FAILED = 'failed'
+    STATUS_PARTIAL = 'partial'
+    
+    STATUS_CHOICES = [
+        (STATUS_PENDING, 'Pending'),
+        (STATUS_IN_PROGRESS, 'In Progress'),
+        (STATUS_SUCCESS, 'Success'),
+        (STATUS_FAILED, 'Failed'),
+        (STATUS_PARTIAL, 'Partial'),
+    ]
+    
+    # Sync Information
+    sync_type = models.CharField(
+        max_length=50,
+        choices=SYNC_TYPE_CHOICES,
+        db_index=True,
+        help_text="Type of synchronization"
+    )
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,
-        default='draft',
-        help_text="Current campaign status"
+        default=STATUS_PENDING,
+        db_index=True,
+        help_text="Sync status"
     )
     
-    # Metrics
-    primary_metric = models.CharField(
-        max_length=100,
-        help_text="Primary success metric"
-    )
-    minimum_sample_size = models.IntegerField(
-        default=100,
-        help_text="Minimum participants per variant"
-    )
-    
-    class Meta:
-        verbose_name = "A/B Test Campaign"
-        verbose_name_plural = "A/B Test Campaigns"
-        ordering = ['-created_at']
-    
-    def __str__(self):
-        return self.name
-
-
-class ABTestVariant(BaseModel):
-    """
-    Variant for A/B testing.
-    """
-    
-    campaign = models.ForeignKey(
-        ABTestCampaign,
-        on_delete=models.CASCADE,
-        related_name='variants',
-        help_text="Parent campaign"
-    )
-    name = models.CharField(
-        max_length=100,
-        help_text="Variant name"
-    )
-    description = models.TextField(
+    # SCORM Cloud Reference
+    scorm_cloud_course_id = models.CharField(
+        max_length=255,
         blank=True,
-        help_text="Variant description"
+        db_index=True,
+        help_text="SCORM Cloud course ID"
     )
-    traffic_percentage = models.IntegerField(
-        default=50,
-        help_text="Percentage of traffic for this variant"
-    )
-    
-    # Configuration
-    configuration = models.JSONField(
-        default=dict,
-        help_text="Variant-specific configuration"
-    )
-    is_control = models.BooleanField(
-        default=False,
-        help_text="Whether this is the control variant"
+    scorm_cloud_registration_id = models.CharField(
+        max_length=255,
+        blank=True,
+        db_index=True,
+        help_text="SCORM Cloud registration ID"
     )
     
-    # Metrics
-    participants = models.IntegerField(
-        default=0,
-        help_text="Number of participants"
-    )
-    conversions = models.IntegerField(
-        default=0,
-        help_text="Number of conversions"
-    )
-    
-    class Meta:
-        verbose_name = "A/B Test Variant"
-        verbose_name_plural = "A/B Test Variants"
-        unique_together = ['campaign', 'name']
-    
-    def __str__(self):
-        return f"{self.campaign.name} - {self.name}"
-    
-    @property
-    def conversion_rate(self):
-        """Calculate conversion rate."""
-        if self.participants == 0:
-            return 0.0
-        return (self.conversions / self.participants) * 100
-
-
-class ABTestRecipientAssignment(BaseModel):
-    """
-    Tracks which variant a user was assigned to.
-    """
-    
-    campaign = models.ForeignKey(
-        ABTestCampaign,
-        on_delete=models.CASCADE,
-        related_name='assignments',
-        help_text="Parent campaign"
-    )
-    variant = models.ForeignKey(
-        ABTestVariant,
-        on_delete=models.CASCADE,
-        related_name='assignments',
-        help_text="Assigned variant"
-    )
-    user = models.ForeignKey(
-        User,
-        on_delete=models.CASCADE,
-        related_name='ab_test_assignments',
-        help_text="Assigned user"
-    )
-    
-    # Assignment
-    assigned_at = models.DateTimeField(
-        auto_now_add=True,
-        help_text="When the assignment was made"
-    )
-    converted = models.BooleanField(
-        default=False,
-        help_text="Whether the user converted"
-    )
-    converted_at = models.DateTimeField(
+    # Local Reference
+    local_course_id = models.UUIDField(
         null=True,
         blank=True,
-        help_text="When the conversion occurred"
+        db_index=True,
+        help_text="Local course/content ID"
     )
-    
-    class Meta:
-        verbose_name = "A/B Test Assignment"
-        verbose_name_plural = "A/B Test Assignments"
-        unique_together = ['campaign', 'user']
-    
-    def __str__(self):
-        return f"{self.user.email} -> {self.variant.name}"
-
-
-class UserActivityLog(BaseModel):
-    """
-    Legacy model for tracking user activities across the platform.
-    Kept for backward compatibility - new code should use UserActivity.
-    """
-    user = models.ForeignKey(
-        User,
-        on_delete=models.CASCADE,
-        related_name='legacy_activity_logs',
-        help_text="User who performed the activity"
-    )
-    action = models.CharField(
-        max_length=100,
-        help_text="Type of activity performed"
-    )
-    entity_type = models.CharField(
-        max_length=50,
-        help_text="Type of entity affected (e.g., course, lesson, quiz)"
-    )
-    entity_id = models.UUIDField(
+    local_registration_id = models.UUIDField(
         null=True,
         blank=True,
-        help_text="ID of the affected entity"
+        db_index=True,
+        help_text="Local registration ID"
     )
-    metadata = models.JSONField(
+    
+    # Sync Details
+    request_payload = models.JSONField(
         default=dict,
         blank=True,
-        help_text="Additional activity metadata"
+        help_text="Request payload sent to SCORM Cloud"
     )
-    ip_address = models.GenericIPAddressField(
+    response_payload = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Response from SCORM Cloud"
+    )
+    
+    # Progress Tracking
+    items_total = models.PositiveIntegerField(
         null=True,
         blank=True,
-        help_text="IP address of the user"
+        help_text="Total items to sync"
     )
-    user_agent = models.TextField(
+    items_processed = models.PositiveIntegerField(
+        null=True,
         blank=True,
-        help_text="User agent string"
+        help_text="Items successfully processed"
     )
-
+    items_failed = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Items that failed"
+    )
+    
+    # Error Tracking
+    error_message = models.TextField(
+        blank=True,
+        help_text="Error message if sync failed"
+    )
+    error_details = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Detailed error information"
+    )
+    
+    # Timing
+    started_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When sync started"
+    )
+    completed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When sync completed"
+    )
+    duration_seconds = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Sync duration in seconds"
+    )
+    
+    # Retry Information
+    retry_count = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of retry attempts"
+    )
+    max_retries = models.PositiveIntegerField(
+        default=3,
+        help_text="Maximum retry attempts"
+    )
+    
+    # User
+    triggered_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='scorm_cloud_syncs',
+        help_text="User who triggered this sync"
+    )
+    
     class Meta:
-        verbose_name = "User Activity Log (Legacy)"
-        verbose_name_plural = "User Activity Logs (Legacy)"
-        ordering = ['-created_at']
+        verbose_name = "SCORM Cloud Sync Log"
+        verbose_name_plural = "SCORM Cloud Sync Logs"
+        ordering = ['-started_at']
         indexes = [
-            models.Index(fields=['user', 'action', 'created_at']),
-            models.Index(fields=['entity_type', 'entity_id']),
+            models.Index(fields=['sync_type', 'status']),
+            models.Index(fields=['scorm_cloud_course_id', 'status']),
+            models.Index(fields=['local_course_id', 'status']),
+            models.Index(fields=['started_at', 'status']),
         ]
-
+    
     def __str__(self):
-        return f"{self.user.email} - {self.action} at {self.created_at}"
+        return f"{self.sync_type} ({self.status}) at {self.started_at}"
+    
+    def mark_started(self):
+        """Mark sync as started."""
+        self.status = self.STATUS_IN_PROGRESS
+        self.started_at = timezone.now()
+        self.save(update_fields=['status', 'started_at', 'updated_at'])
+    
+    def mark_completed(self, items_processed=0, items_failed=0):
+        """Mark sync as completed."""
+        self.status = self.STATUS_SUCCESS if items_failed == 0 else self.STATUS_PARTIAL
+        self.completed_at = timezone.now()
+        self.items_processed = items_processed
+        self.items_failed = items_failed
+        if self.started_at:
+            self.duration_seconds = int((self.completed_at - self.started_at).total_seconds())
+        self.save(update_fields=['status', 'completed_at', 'items_processed', 'items_failed', 'duration_seconds', 'updated_at'])
+    
+    def mark_failed(self, error_message, error_details=None):
+        """Mark sync as failed."""
+        self.status = self.STATUS_FAILED
+        self.error_message = error_message[:1000]
+        if error_details:
+            self.error_details = error_details
+        self.completed_at = timezone.now()
+        if self.started_at:
+            self.duration_seconds = int((self.completed_at - self.started_at).total_seconds())
+        self.save(update_fields=['status', 'error_message', 'error_details', 'completed_at', 'duration_seconds', 'updated_at'])
