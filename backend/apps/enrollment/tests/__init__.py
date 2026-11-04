@@ -1,3 +1,0 @@
-"""
-Enrollment Tests Package
-"""

@@ -1,1 +1,0 @@
-# Forum tests package

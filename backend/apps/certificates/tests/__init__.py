@@ -1,3 +1,0 @@
-"""
-Certificate Tests Package
-"""
