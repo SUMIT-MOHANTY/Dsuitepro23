@@ -24,9 +24,10 @@ urlpatterns = [
         # Core endpoints (healthcheck, system info)
         path('', include('apps.core.urls', namespace='core')),
         
+        # Users app endpoints (authentication and user management)
+        path('', include('apps.users.urls')),
+        
         # Domain app endpoints (to be implemented by domain agents)
-        # path('auth/', include('apps.users.urls.auth', namespace='auth')),
-        # path('users/', include('apps.users.urls.users', namespace='users')),
         # path('courses/', include('apps.courses.urls', namespace='courses')),
         # path('enrollments/', include('apps.enrollment.urls', namespace='enrollment')),
         # path('assessments/', include('apps.assessment.urls', namespace='assessment')),
