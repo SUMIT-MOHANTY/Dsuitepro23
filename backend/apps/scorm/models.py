@@ -14,6 +14,134 @@ from apps.courses.models import ContentItem
 User = get_user_model()
 
 
+# SCORM 1.2 Error Codes
+class SCORMErrorCodes:
+    """SCORM 1.2 RTE Error Codes"""
+    NO_ERROR = '0'
+    GENERAL_EXCEPTION = '101'
+    INVALID_ARGUMENT = '201'
+    ELEMENT_CANNOT_HAVE_CHILDREN = '202'
+    ELEMENT_NOT_ARRAY = '203'
+    NOT_INITIALIZED = '301'
+    ALREADY_INITIALIZED = '302'
+    API_NOT_IMPLEMENTED = '401'
+    INVALID_SET_VALUE_KEYWORD = '402'
+    ELEMENT_READ_ONLY = '403'
+    ELEMENT_WRITE_ONLY = '404'
+    INCORRECT_DATA_TYPE = '405'
+    
+    ERROR_MESSAGES = {
+        NO_ERROR: 'No error',
+        GENERAL_EXCEPTION: 'General exception',
+        INVALID_ARGUMENT: 'Invalid argument error',
+        ELEMENT_CANNOT_HAVE_CHILDREN: 'Element cannot have children',
+        ELEMENT_NOT_ARRAY: 'Element not an array - cannot have count',
+        NOT_INITIALIZED: 'Not initialized',
+        ALREADY_INITIALIZED: 'Already initialized',
+        API_NOT_IMPLEMENTED: 'Not implemented error',
+        INVALID_SET_VALUE_KEYWORD: 'Invalid set value, element is a keyword',
+        ELEMENT_READ_ONLY: 'Element is read only',
+        ELEMENT_WRITE_ONLY: 'Element is write only',
+        INCORRECT_DATA_TYPE: 'Incorrect data type',
+    }
+
+
+# SCORM 1.2 Lesson Status Values
+class SCORMLessonStatus:
+    """SCORM 1.2 cmi.core.lesson_status values"""
+    PASSED = 'passed'
+    COMPLETED = 'completed'
+    FAILED = 'failed'
+    INCOMPLETE = 'incomplete'
+    NOT_ATTEMPTED = 'not attempted'
+    BROWSED = 'browsed'
+    
+    CHOICES = [
+        (PASSED, 'Passed'),
+        (COMPLETED, 'Completed'),
+        (FAILED, 'Failed'),
+        (INCOMPLETE, 'Incomplete'),
+        (NOT_ATTEMPTED, 'Not Attempted'),
+        (BROWSED, 'Browsed'),
+    ]
+
+
+# SCORM 1.2 Entry Values
+class SCORMEntry:
+    """SCORM 1.2 cmi.core.entry values"""
+    AB_INITIO = 'ab-initio'
+    RESUME = 'resume'
+    EMPTY = ''
+    
+    CHOICES = [
+        (AB_INITIO, 'Ab-initio'),
+        (RESUME, 'Resume'),
+        (EMPTY, 'Empty'),
+    ]
+
+
+# SCORM 1.2 Exit Values
+class SCORMExit:
+    """SCORM 1.2 cmi.core.exit values"""
+    SUSPEND = 'suspend'
+    LOGOUT = 'logout'
+    TIMEOUT = 'timeout'
+    NORMAL = ''
+    
+    CHOICES = [
+        (SUSPEND, 'Suspend'),
+        (LOGOUT, 'Logout'),
+        (TIMEOUT, 'Timeout'),
+        (NORMAL, 'Normal'),
+    ]
+
+
+# SCORM 1.2 Credit Values
+class SCORMCredit:
+    """SCORM 1.2 cmi.core.credit values"""
+    CREDIT = 'credit'
+    NO_CREDIT = 'no-credit'
+    
+    CHOICES = [
+        (CREDIT, 'Credit'),
+        (NO_CREDIT, 'No Credit'),
+    ]
+
+
+# SCORM 1.2 Lesson Mode Values
+class SCORMLessonMode:
+    """SCORM 1.2 cmi.core.lesson_mode values"""
+    BROWSE = 'browse'
+    NORMAL = 'normal'
+    REVIEW = 'review'
+    
+    CHOICES = [
+        (BROWSE, 'Browse'),
+        (NORMAL, 'Normal'),
+        (REVIEW, 'Review'),
+    ]
+
+
+# SCORM Registration Status
+class SCORMRegistrationStatus:
+    """Internal SCORM registration status"""
+    NOT_ATTEMPTED = 'not_attempted'
+    IN_PROGRESS = 'in_progress'
+    COMPLETED = 'completed'
+    PASSED = 'passed'
+    FAILED = 'failed'
+    SUSPENDED = 'suspended'
+    
+    CHOICES = [
+        (NOT_ATTEMPTED, 'Not Attempted'),
+        (IN_PROGRESS, 'In Progress'),
+        (COMPLETED, 'Completed'),
+        (PASSED, 'Passed'),
+        (FAILED, 'Failed'),
+        (SUSPENDED, 'Suspended'),
+    ]
+
+
 class SCORMRegistration(BaseModel):
     """
     Model representing a user's registration for SCORM content.
@@ -248,6 +376,16 @@ class SCORMRegistration(BaseModel):
         return f"{self.user.email} - {self.content_item.title}"
     
     @property
+    def student_id(self):
+        """Return student ID for SCORM cmi.core.student_id"""
+        return str(self.user.id)
+    
+    @property
+    def student_name(self):
+        """Return student name for SCORM cmi.core.student_name"""
+        return self.user.get_full_name() or self.user.email
+    
+    @property
     def is_completed(self):
         """Check if the SCORM content is completed."""
         return self.completion_status in [self.COMPLETION_STATUS_COMPLETED, self.COMPLETION_STATUS_PASSED]
@@ -303,6 +441,18 @@ class SCORMRegistration(BaseModel):
             self.score_raw = score
         self.completed_at = timezone.now()
         self.save(update_fields=['status', 'completion_status', 'score_raw', 'completed_at', 'updated_at'])
+    
+    def mark_suspended(self):
+        """Mark this registration as suspended."""
+        self.status = self.STATUS_SUSPENDED
+        self.exit_status = self.EXIT_STATUS_SUSPEND
+        self.save(update_fields=['status', 'exit_status', 'updated_at'])
+    
+    def calculate_entry_mode(self):
+        """Calculate entry mode based on previous session data."""
+        if self.total_time and self.total_time != '0000:00:00':
+            return self.ENTRY_STATUS_RESUME
+        return self.ENTRY_STATUS_AB_INITIO
 
 
 class SCORMSession(TimestampedModel):
@@ -357,23 +507,63 @@ class SCORMSession(TimestampedModel):
         blank=True,
         help_text="When the session ended"
     )
-    
-    # Session data (transient until commit)
-    session_data = models.JSONField(
-        default=dict,
-        blank=True,
-        help_text="Transient SCORM data for this session"
+    last_activity_at = models.DateTimeField(
+        auto_now=True,
+        help_text="Last activity timestamp"
     )
     
-    # Client information
+    # Session tracking
+    is_active = models.BooleanField(
+        default=True,
+        db_index=True,
+        help_text="Whether this session is currently active"
+    )
     user_agent = models.TextField(
         blank=True,
-        help_text="User agent string from client"
+        help_text="User agent string from the browser"
     )
     ip_address = models.GenericIPAddressField(
         null=True,
         blank=True,
-        help_text="IP address of the client"
+        help_text="IP address of the learner"
+    )
+    
+    # SCORM 1.2 RTE State Tracking
+    api_initialized = models.BooleanField(
+        default=False,
+        help_text="Whether LMSInitialize has been called"
+    )
+    last_error_code = models.CharField(
+        max_length=10,
+        default='0',
+        help_text="Last SCORM error code (cmi.core.last_error)"
+    )
+    error_diagnostic = models.TextField(
+        blank=True,
+        help_text="Diagnostic information for the last error"
+    )
+    launch_time = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the SCORM content was launched"
+    )
+    commit_time = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the last LMSCommit was called"
+    )
+    
+    # Accumulated session time (in seconds)
+    accumulated_time = models.PositiveIntegerField(
+        default=0,
+        help_text="Accumulated session time in seconds"
+    )
+    
+    # Current CMI data snapshot (for quick access)
+    cmi_data = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Current CMI data snapshot"
     )
     
     class Meta:
@@ -381,49 +571,88 @@ class SCORMSession(TimestampedModel):
         verbose_name_plural = "SCORM Sessions"
         ordering = ['-started_at']
         indexes = [
-            models.Index(fields=['registration', 'status']),
+            models.Index(fields=['registration', 'is_active']),
             models.Index(fields=['session_id']),
+            models.Index(fields=['status', 'is_active']),
             models.Index(fields=['started_at']),
+            models.Index(fields=['last_activity_at']),
         ]
     
     def __str__(self):
         return f"Session {self.session_id} for {self.registration}"
     
-    @property
-    def duration_seconds(self):
-        """Calculate session duration in seconds."""
-        if self.ended_at:
-            return (self.ended_at - self.started_at).total_seconds()
-        return None
-    
-    def end_session(self, status=SESSION_STATUS_COMPLETED):
-        """End this session with the specified status."""
+    def end_session(self, status=None):
+        """End this session with the given status."""
         from django.utils import timezone
-        self.status = status
+        self.is_active = False
         self.ended_at = timezone.now()
-        self.save(update_fields=['status', 'ended_at', 'updated_at'])
+        if status:
+            self.status = status
+        self.save(update_fields=['is_active', 'ended_at', 'status', 'updated_at'])
+    
+    def mark_suspended(self):
+        """Mark this session as suspended."""
+        self.end_session(self.SESSION_STATUS_SUSPENDED)
+    
+    def mark_completed(self):
+        """Mark this session as completed."""
+        self.end_session(self.SESSION_STATUS_COMPLETED)
+    
+    def mark_timeout(self):
+        """Mark this session as timed out."""
+        self.end_session(self.SESSION_STATUS_TIMEOUT)
+    
+    def update_activity(self):
+        """Update the last activity timestamp."""
+        from django.utils import timezone
+        self.last_activity_at = timezone.now()
+        self.save(update_fields=['last_activity_at'])
+    
+    def set_error(self, code, diagnostic=''):
+        """Set the last error code and diagnostic."""
+        self.last_error_code = code
+        self.error_diagnostic = diagnostic
+        self.save(update_fields=['last_error_code', 'error_diagnostic', 'updated_at'])
+    
+    def clear_error(self):
+        """Clear the error state."""
+        self.last_error_code = '0'
+        self.error_diagnostic = ''
+        self.save(update_fields=['last_error_code', 'error_diagnostic', 'updated_at'])
+    
+    def record_commit(self):
+        """Record a commit operation."""
+        from django.utils import timezone
+        self.commit_time = timezone.now()
+        self.save(update_fields=['commit_time', 'updated_at'])
+    
+    def record_launch(self):
+        """Record the launch time."""
+        from django.utils import timezone
+        self.launch_time = timezone.now()
+        self.save(update_fields=['launch_time', 'updated_at'])
 
 
 class SCORMRuntimeData(TimestampedModel):
     """
-    Model storing SCORM runtime data (cmi.* values) with full history.
-    Maintains a history of all SCORM data commits for audit and recovery.
+    Model storing SCORM runtime data (cmi.* values).
+    Tracks the current state of SCORM data elements during a session.
     """
     
+    DATA_TYPE_CURRENT = 'current'
+    DATA_TYPE_SNAPSHOT = 'snapshot'
     DATA_TYPE_COMMIT = 'commit'
-    DATA_TYPE_FINISH = 'finish'
-    DATA_TYPE_SUSPEND = 'suspend'
     
     DATA_TYPE_CHOICES = [
+        (DATA_TYPE_CURRENT, 'Current'),
+        (DATA_TYPE_SNAPSHOT, 'Snapshot'),
         (DATA_TYPE_COMMIT, 'Commit'),
-        (DATA_TYPE_FINISH, 'Finish'),
-        (DATA_TYPE_SUSPEND, 'Suspend'),
     ]
     
     registration = models.ForeignKey(
         SCORMRegistration,
         on_delete=models.CASCADE,
-        related_name='runtime_data_history',
+        related_name='runtime_data',
         help_text="Associated SCORM registration"
     )
     session = models.ForeignKey(
@@ -439,11 +668,11 @@ class SCORMRuntimeData(TimestampedModel):
     data_type = models.CharField(
         max_length=20,
         choices=DATA_TYPE_CHOICES,
-        default=DATA_TYPE_COMMIT,
-        help_text="Type of data storage event"
+        default=DATA_TYPE_CURRENT,
+        help_text="Type of runtime data"
     )
     
-    # Core SCORM data elements
+    # Core CMI data
     lesson_location = models.CharField(
         max_length=255,
         blank=True,
@@ -699,20 +928,22 @@ class SCORMObjective(BaseModel):
 
 class SCORMCloudSyncLog(TimestampedModel):
     """
-    Model logging SCORM Cloud synchronization attempts and results.
-    Used for debugging and monitoring external LMS integrations.
+    Model logging SCORM Cloud synchronization attempts.
+    Tracks sync status for debugging and audit purposes.
     """
     
-    SYNC_STATUS_PENDING = 'pending'
-    SYNC_STATUS_SUCCESS = 'success'
-    SYNC_STATUS_FAILED = 'failed'
-    SYNC_STATUS_RETRY = 'retry'
+    SYNC_TYPE_CHOICES = [
+        ('push', 'Push to Cloud'),
+        ('pull', 'Pull from Cloud'),
+        ('webhook', 'Webhook'),
+        ('manual', 'Manual Sync'),
+    ]
     
-    SYNC_STATUS_CHOICES = [
-        (SYNC_STATUS_PENDING, 'Pending'),
-        (SYNC_STATUS_SUCCESS, 'Success'),
-        (SYNC_STATUS_FAILED, 'Failed'),
-        (SYNC_STATUS_RETRY, 'Retry'),
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('success', 'Success'),
+        ('failed', 'Failed'),
+        ('partial', 'Partial'),
     ]
     
     registration = models.ForeignKey(
@@ -722,35 +953,19 @@ class SCORMCloudSyncLog(TimestampedModel):
         help_text="Associated SCORM registration"
     )
     
-    # Sync details
     sync_type = models.CharField(
-        max_length=50,
-        help_text="Type of sync operation (e.g., 'progress', 'completion', 'registration')"
+        max_length=20,
+        choices=SYNC_TYPE_CHOICES,
+        help_text="Type of synchronization"
     )
     status = models.CharField(
         max_length=20,
-        choices=SYNC_STATUS_CHOICES,
-        default=SYNC_STATUS_PENDING,
+        choices=STATUS_CHOICES,
+        default='pending',
         help_text="Sync status"
     )
     
-    # Request/Response data
-    request_data = models.JSONField(
-        default=dict,
-        blank=True,
-        help_text="Data sent to SCORM Cloud"
-    )
-    response_data = models.JSONField(
-        default=dict,
-        blank=True,
-        help_text="Response from SCORM Cloud"
-    )
-    error_message = models.TextField(
-        blank=True,
-        help_text="Error message if sync failed"
-    )
-    
-    # Timing
+    # Sync details
     started_at = models.DateTimeField(
         auto_now_add=True,
         help_text="When the sync started"
@@ -761,10 +976,17 @@ class SCORMCloudSyncLog(TimestampedModel):
         help_text="When the sync completed"
     )
     
-    # Retry tracking
-    retry_count = models.PositiveIntegerField(
-        default=0,
-        help_text="Number of retry attempts"
+    # Error tracking
+    error_message = models.TextField(
+        blank=True,
+        help_text="Error message if sync failed"
+    )
+    
+    # Raw responses
+    scorm_cloud_response = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Raw response from SCORM Cloud"
     )
     
     class Meta:
@@ -772,32 +994,12 @@ class SCORMCloudSyncLog(TimestampedModel):
         verbose_name_plural = "SCORM Cloud Sync Logs"
         ordering = ['-started_at']
         indexes = [
-            models.Index(fields=['registration', 'status']),
-            models.Index(fields=['sync_type', 'status']),
-            models.Index(fields=['started_at']),
+            models.Index(fields=['registration', '-started_at']),
+            models.Index(fields=['status', 'sync_type']),
         ]
     
     def __str__(self):
         return f"{self.sync_type} sync for {self.registration} - {self.status}"
-    
-    def mark_success(self, response_data=None):
-        """Mark this sync as successful."""
-        from django.utils import timezone
-        self.status = self.SYNC_STATUS_SUCCESS
-        self.completed_at = timezone.now()
-        if response_data:
-            self.response_data = response_data
-        self.save(update_fields=['status', 'completed_at', 'response_data', 'updated_at'])
-    
-    def mark_failed(self, error_message, response_data=None):
-        """Mark this sync as failed."""
-        from django.utils import timezone
-        self.status = self.SYNC_STATUS_FAILED
-        self.completed_at = timezone.now()
-        self.error_message = error_message
-        if response_data:
-            self.response_data = response_data
-        self.save(update_fields=['status', 'completed_at', 'error_message', 'response_data', 'updated_at'])
 
 
 class xAPIStatement(TimestampedModel):
@@ -806,16 +1008,26 @@ class xAPIStatement(TimestampedModel):
     Converts SCORM data to xAPI format for LRS integration.
     """
     
-    STATUS_PENDING = 'pending'
-    STATUS_SENT = 'sent'
-    STATUS_FAILED = 'failed'
-    STATUS_RETRY = 'retry'
+    VERB_CHOICES = [
+        ('initialized', 'Initialized'),
+        ('launched', 'Launched'),
+        ('attempted', 'Attempted'),
+        ('experienced', 'Experienced'),
+        ('completed', 'Completed'),
+        ('passed', 'Passed'),
+        ('failed', 'Failed'),
+        ('suspended', 'Suspended'),
+        ('resumed', 'Resumed'),
+        ('terminated', 'Terminated'),
+        ('interacted', 'Interacted'),
+        ('answered', 'Answered'),
+    ]
     
     STATUS_CHOICES = [
-        (STATUS_PENDING, 'Pending'),
-        (STATUS_SENT, 'Sent'),
-        (STATUS_FAILED, 'Failed'),
-        (STATUS_RETRY, 'Retry'),
+        ('pending', 'Pending'),
+        ('sent', 'Sent'),
+        ('failed', 'Failed'),
+        ('retrying', 'Retrying'),
     ]
     
     registration = models.ForeignKey(
@@ -829,16 +1041,21 @@ class xAPIStatement(TimestampedModel):
     statement_id = models.UUIDField(
         default=uuid.uuid4,
         unique=True,
+        editable=False,
         help_text="Unique xAPI statement ID"
     )
+    verb = models.CharField(
+        max_length=50,
+        choices=VERB_CHOICES,
+        help_text="xAPI verb"
+    )
+    
+    # Statement content
     actor = models.JSONField(
-        help_text="xAPI actor (learner) data"
+        help_text="xAPI actor (learner)"
     )
-    verb = models.JSONField(
-        help_text="xAPI verb data"
-    )
-    object = models.JSONField(
-        help_text="xAPI object (activity) data"
+    object_data = models.JSONField(
+        help_text="xAPI object (activity)"
     )
     result = models.JSONField(
         default=dict,
@@ -848,22 +1065,19 @@ class xAPIStatement(TimestampedModel):
     context = models.JSONField(
         default=dict,
         blank=True,
-        help_text="xAPI context data"
-    )
-    timestamp = models.DateTimeField(
-        help_text="xAPI statement timestamp"
+        help_text="xAPI context"
     )
     
-    # Full statement JSON
-    statement_json = models.JSONField(
-        help_text="Complete xAPI statement as JSON"
+    # Full statement
+    full_statement = models.JSONField(
+        help_text="Complete xAPI statement"
     )
     
     # Sending status
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,
-        default=STATUS_PENDING,
+        default='pending',
         help_text="Statement sending status"
     )
     sent_at = models.DateTimeField(
@@ -885,10 +1099,10 @@ class xAPIStatement(TimestampedModel):
         verbose_name_plural = "xAPI Statements"
         ordering = ['-created_at']
         indexes = [
-            models.Index(fields=['registration', 'status']),
+            models.Index(fields=['registration', '-created_at']),
+            models.Index(fields=['status', 'verb']),
             models.Index(fields=['statement_id']),
-            models.Index(fields=['status', 'retry_count']),
         ]
     
     def __str__(self):
-        return f"xAPI Statement {self.statement_id} for {self.registration}"
+        return f"{self.verb} statement for {self.registration}"
