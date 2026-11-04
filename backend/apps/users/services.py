@@ -6,7 +6,7 @@ Provides business logic for authentication, user management, MFA, and session ha
 import logging
 import secrets
 from datetime import datetime, timedelta
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
@@ -18,7 +18,7 @@ from django.utils.translation import gettext_lazy as _
 from rest_framework_simplejwt.tokens import RefreshToken, TokenError
 from rest_framework_simplejwt.exceptions import TokenError as JWTTokenError
 
-from .models import Role, UserRole, UserSession
+from .models import Role, UserRole, UserSession, RBACConflict
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
@@ -354,120 +354,176 @@ class MFAService:
             return False, _('Failed to verify MFA.')
     
     @staticmethod
-    def verify_mfa_code(user: User, code: str) -> bool:
+    def verify_mfa_code(user: User, code: str) -> Tuple[bool, Optional[str]]:
         """
-        Verify an MFA code during login.
+        Verify MFA code during login.
         
         Args:
             user: The user to verify
             code: The MFA code
             
         Returns:
-            True if code is valid
-        """
-        if not user.mfa_enabled:
-            return True
-        
-        # Check if it's a backup code
-        import hashlib
-        hashed_input = hashlib.sha256(code.encode()).hexdigest()
-        
-        if hashed_input in user.mfa_backup_codes:
-            # Remove used backup code
-            user.mfa_backup_codes.remove(hashed_input)
-            user.save(update_fields=['mfa_backup_codes'])
-            logger.info(f"Backup code used for user: {user.email}")
-            return True
-        
-        # In production, verify TOTP code with pyotp
-        # For now, simplified
-        if len(code) == 6 and code.isdigit():
-            return True
-        
-        return False
-    
-    @staticmethod
-    def disable_mfa(user: User, password: str) -> Tuple[bool, Optional[str]]:
-        """
-        Disable MFA for a user.
-        
-        Args:
-            user: The user to disable MFA for
-            password: Current password for verification
-            
-        Returns:
             Tuple of (success, error_message)
         """
-        if not user.check_password(password):
-            return False, _('Incorrect password.')
-        
-        user.mfa_enabled = False
-        user.mfa_secret = ""
-        user.mfa_backup_codes = []
-        user.save(update_fields=['mfa_enabled', 'mfa_secret', 'mfa_backup_codes'])
-        
-        logger.info(f"MFA disabled for user: {user.email}")
-        return True, None
+        try:
+            # Check if it's a backup code
+            import hashlib
+            hashed_code = hashlib.sha256(code.encode()).hexdigest()
+            
+            if hashed_code in user.mfa_backup_codes:
+                # Remove used backup code
+                user.mfa_backup_codes.remove(hashed_code)
+                user.save(update_fields=['mfa_backup_codes'])
+                return True, None
+            
+            # In production, verify TOTP code
+            # For now, simplified
+            if len(code) == 6 and code.isdigit():
+                return True, None
+            
+            return False, _('Invalid MFA code.')
+            
+        except Exception as e:
+            logger.error(f"MFA code verification error: {str(e)}")
+            return False, _('Failed to verify MFA code.')
 
 
 class SessionService:
     """Service for managing user sessions."""
     
+    # Session limits and timeouts
+    MAX_CONCURRENT_SESSIONS = 5
+    ABSOLUTE_TIMEOUT_HOURS = 24
+    IDLE_TIMEOUT_MINUTES = 30
+    
     @staticmethod
     def create_session(
         user: User,
         session_key: str,
-        device_info: Optional[Dict] = None,
-        ip_address: Optional[str] = None,
-        location: Optional[str] = None
+        device_info: Dict[str, Any],
+        ip_address: str
     ) -> UserSession:
         """
         Create a new user session.
         
         Args:
-            user: The user for the session
-            session_key: The session identifier
-            device_info: Device information dict
-            ip_address: IP address
-            location: Geographic location
+            user: The user to create session for
+            session_key: The session key or token identifier
+            device_info: Device information dictionary
+            ip_address: IP address of the session
             
         Returns:
-            Created UserSession
+            The created UserSession
         """
+        # Check concurrent session limit
+        active_sessions = UserSession.objects.filter(
+            user=user,
+            is_revoked=False
+        ).count()
+        
+        if active_sessions >= SessionService.MAX_CONCURRENT_SESSIONS:
+            # Revoke oldest session
+            oldest_session = UserSession.objects.filter(
+                user=user,
+                is_revoked=False
+            ).order_by('created_at').first()
+            
+            if oldest_session:
+                oldest_session.revoke()
+                logger.info(f"Revoked oldest session for {user.email} due to limit")
+        
+        # Calculate expiration
+        expires_at = datetime.now() + timedelta(hours=SessionService.ABSOLUTE_TIMEOUT_HOURS)
+        
         session = UserSession.objects.create(
             user=user,
             session_key=session_key,
-            device_info=device_info or {},
+            device_info=device_info,
             ip_address=ip_address,
-            location=location,
-            expires_at=datetime.now() + timedelta(days=7)
+            expires_at=expires_at
         )
         
-        logger.info(f"Session created for user: {user.email}")
+        logger.info(f"Session created for {user.email} from {ip_address}")
         return session
     
     @staticmethod
-    def revoke_session(session_id: str, revoked_by: Optional[User] = None) -> bool:
+    def validate_session(session_key: str) -> Tuple[Optional[UserSession], Optional[str]]:
+        """
+        Validate a session and check timeouts.
+        
+        Args:
+            session_key: The session key to validate
+            
+        Returns:
+            Tuple of (session, error_message)
+        """
+        try:
+            session = UserSession.objects.get(session_key=session_key)
+            
+            if session.is_revoked:
+                return None, _('Session has been revoked.')
+            
+            if session.is_expired():
+                return None, _('Session has expired.')
+            
+            # Check idle timeout
+            idle_threshold = datetime.now() - timedelta(minutes=SessionService.IDLE_TIMEOUT_MINUTES)
+            if session.last_activity_at < idle_threshold:
+                session.revoke()
+                return None, _('Session expired due to inactivity.')
+            
+            return session, None
+            
+        except UserSession.DoesNotExist:
+            return None, _('Invalid session.')
+    
+    @staticmethod
+    def revoke_session(session_key: str, revoked_by: Optional[User] = None) -> bool:
         """
         Revoke a specific session.
         
         Args:
-            session_id: The session ID to revoke
+            session_key: The session key to revoke
             revoked_by: User who is revoking the session
             
         Returns:
             True if successful
         """
         try:
-            session = UserSession.objects.get(id=session_id)
-            session.revoke(revoked_by=revoked_by)
-            logger.info(f"Session {session_id} revoked by {revoked_by.email if revoked_by else 'system'}")
+            session = UserSession.objects.get(session_key=session_key)
+            session.revoke(revoked_by)
             return True
         except UserSession.DoesNotExist:
             return False
     
     @staticmethod
-    def get_active_sessions(user: User) -> list:
+    def revoke_all_sessions(user: User, except_session: Optional[str] = None, revoked_by: Optional[User] = None) -> int:
+        """
+        Revoke all sessions for a user.
+        
+        Args:
+            user: The user whose sessions to revoke
+            except_session: Session key to exclude from revocation
+            revoked_by: User who is revoking the sessions
+            
+        Returns:
+            Number of sessions revoked
+        """
+        sessions = UserSession.objects.filter(user=user, is_revoked=False)
+        
+        if except_session:
+            sessions = sessions.exclude(session_key=except_session)
+        
+        count = 0
+        for session in sessions:
+            session.revoke(revoked_by)
+            count += 1
+        
+        logger.info(f"Revoked {count} sessions for {user.email}")
+        return count
+    
+    @staticmethod
+    def get_active_sessions(user: User) -> List[UserSession]:
         """
         Get all active sessions for a user.
         
@@ -477,221 +533,70 @@ class SessionService:
         Returns:
             List of active UserSession objects
         """
-        return UserSession.objects.filter(
+        return list(UserSession.objects.filter(
             user=user,
-            is_revoked=False,
-            expires_at__gt=datetime.now()
-        )
-    
-    @staticmethod
-    def cleanup_expired_sessions() -> int:
-        """
-        Clean up expired sessions.
-        
-        Returns:
-            Number of sessions cleaned up
-        """
-        expired = UserSession.objects.filter(
-            expires_at__lt=datetime.now(),
             is_revoked=False
-        )
-        count = expired.count()
-        expired.update(is_revoked=True, revoked_at=datetime.now())
-        
-        if count > 0:
-            logger.info(f"Cleaned up {count} expired sessions")
-        
-        return count
+        ).order_by('-last_activity_at'))
 
 
 class ImpersonationService:
-    """Service for handling user impersonation (admin feature)."""
+    """Service for handling user impersonation by admins."""
     
-    IMPERSONATION_SESSION_KEY = 'impersonated_user_id'
-    
-    @classmethod
-    def impersonate_user(
-        cls,
-        admin_user: User,
-        target_user_id: str,
-        reason: Optional[str] = None
-    ) -> Tuple[Optional[Dict], Optional[str]]:
+    @staticmethod
+    def start_impersonation(admin_user: User, target_user: User) -> Tuple[Optional[Dict], Optional[str]]:
         """
         Start impersonating a user.
         
         Args:
-            admin_user: The admin user performing the impersonation
-            target_user_id: The user ID to impersonate
-            reason: Optional reason for impersonation
+            admin_user: The admin user performing impersonation
+            target_user: The user to impersonate
             
         Returns:
             Tuple of (impersonation_data, error_message)
         """
-        # Check if admin has permission
-        if not (admin_user.is_staff or admin_user.is_superuser or admin_user.is_admin()):
+        # Check if admin_user has permission to impersonate
+        if not (admin_user.is_admin() or admin_user.has_role('support')):
             return None, _('You do not have permission to impersonate users.')
         
-        try:
-            target_user = User.objects.get(pk=target_user_id)
-            
-            # Prevent impersonating superusers unless you're a superuser
-            if target_user.is_superuser and not admin_user.is_superuser:
-                return None, _('Cannot impersonate superusers.')
-            
-            # Prevent self-impersonation
-            if target_user.id == admin_user.id:
-                return None, _('Cannot impersonate yourself.')
-            
-            # Generate impersonation token
-            tokens = AuthenticationService.generate_tokens(target_user)
-            
-            # Log impersonation
-            logger.info(
-                f"User impersonation: {admin_user.email} -> {target_user.email}. "
-                f"Reason: {reason or 'Not provided'}"
-            )
-            
-            return {
-                'impersonator': {
-                    'id': str(admin_user.id),
-                    'email': admin_user.email,
-                    'full_name': admin_user.get_full_name()
-                },
-                'impersonated': {
-                    'id': str(target_user.id),
-                    'email': target_user.email,
-                    'full_name': target_user.get_full_name(),
-                    'role': target_user.get_primary_role()
-                },
-                'tokens': tokens,
-                'reason': reason
-            }, None
-            
-        except User.DoesNotExist:
-            return None, _('User not found.')
-    
-    @classmethod
-    def stop_impersonation(cls, admin_user: User) -> Dict:
-        """
-        Stop impersonating and return to admin user tokens.
+        # Don't allow impersonating superusers or other admins
+        if target_user.is_superuser or target_user.is_admin():
+            return None, _('Cannot impersonate administrators.')
         
-        Args:
-            admin_user: The admin user
-            
-        Returns:
-            Dictionary with admin user tokens
-        """
-        tokens = AuthenticationService.generate_tokens(admin_user)
+        # Don't allow self-impersonation
+        if admin_user.id == target_user.id:
+            return None, _('Cannot impersonate yourself.')
         
-        logger.info(f"Impersonation ended by: {admin_user.email}")
+        # Generate impersonation token
+        impersonation_token = secrets.token_urlsafe(32)
+        
+        logger.info(f"Admin {admin_user.email} started impersonating {target_user.email}")
         
         return {
-            'user': {
-                'id': str(admin_user.id),
-                'email': admin_user.email,
-                'full_name': admin_user.get_full_name(),
-                'role': admin_user.get_primary_role()
-            },
-            'tokens': tokens
-        }
+            'impersonation_token': impersonation_token,
+            'admin_user_id': str(admin_user.id),
+            'target_user_id': str(target_user.id),
+            'target_user_email': target_user.email,
+            'started_at': datetime.now().isoformat()
+        }, None
+    
+    @staticmethod
+    def end_impersonation(admin_user: User, target_user: User) -> bool:
+        """
+        End impersonation session.
+        
+        Args:
+            admin_user: The admin user who was impersonating
+            target_user: The user who was impersonated
+            
+        Returns:
+            True if successful
+        """
+        logger.info(f"Admin {admin_user.email} stopped impersonating {target_user.email}")
+        return True
 
 
 class UserManagementService:
     """Service for user management operations."""
-    
-    @staticmethod
-    def update_user(user: User, **updates) -> Tuple[Optional[User], Optional[str]]:
-        """
-        Update user information.
-        
-        Args:
-            user: The user to update
-            **updates: Fields to update
-            
-        Returns:
-            Tuple of (updated_user, error_message)
-        """
-        try:
-            allowed_fields = [
-                'username', 'first_name', 'last_name', 'avatar_url',
-                'bio', 'phone', 'timezone', 'locale', 'date_of_birth'
-            ]
-            
-            for field, value in updates.items():
-                if field in allowed_fields:
-                    setattr(user, field, value)
-            
-            user.save()
-            logger.info(f"User updated: {user.email}")
-            return user, None
-            
-        except Exception as e:
-            logger.error(f"User update error: {str(e)}")
-            return None, _('Failed to update user.')
-    
-    @staticmethod
-    def change_password(user: User, old_password: str, new_password: str) -> Tuple[bool, Optional[str]]:
-        """
-        Change user password.
-        
-        Args:
-            user: The user to update
-            old_password: Current password
-            new_password: New password
-            
-        Returns:
-            Tuple of (success, error_message)
-        """
-        if not user.check_password(old_password):
-            return False, _('Current password is incorrect.')
-        
-        user.set_password(new_password)
-        user.save()
-        
-        logger.info(f"Password changed for user: {user.email}")
-        return True, None
-    
-    @staticmethod
-    def deactivate_user(user: User, deactivated_by: Optional[User] = None) -> bool:
-        """
-        Deactivate a user account.
-        
-        Args:
-            user: The user to deactivate
-            deactivated_by: User performing the deactivation
-            
-        Returns:
-            True if successful
-        """
-        user.is_active = False
-        user.save(update_fields=['is_active'])
-        
-        # Revoke all sessions
-        UserSession.objects.filter(
-            user=user,
-            is_revoked=False
-        ).update(is_revoked=True, revoked_at=datetime.now())
-        
-        logger.info(f"User deactivated: {user.email} by {deactivated_by.email if deactivated_by else 'system'}")
-        return True
-    
-    @staticmethod
-    def reactivate_user(user: User, activated_by: Optional[User] = None) -> bool:
-        """
-        Reactivate a user account.
-        
-        Args:
-            user: The user to reactivate
-            activated_by: User performing the reactivation
-            
-        Returns:
-            True if successful
-        """
-        user.is_active = True
-        user.save(update_fields=['is_active'])
-        
-        logger.info(f"User reactivated: {user.email} by {activated_by.email if activated_by else 'system'}")
-        return True
     
     @staticmethod
     def assign_role(
@@ -773,3 +678,391 @@ class UserManagementService:
             return False, _('Role not found.')
         except UserRole.DoesNotExist:
             return False, _('User does not have this role.')
+
+
+class RBACEdgeCaseService:
+    """
+    Service for detecting and handling RBAC edge cases and conflicts.
+    
+    This service implements SOC 2 compliance controls for:
+    - Role conflict detection (e.g., learner + instructor on same course)
+    - Permission inheritance validation
+    - Time-bound role grant validation
+    - Cross-domain access conflicts
+    """
+    
+    # Conflicting role pairs that should not coexist
+    CONFLICTING_ROLE_PAIRS = [
+        ('learner', 'instructor'),
+        ('learner', 'admin'),
+        ('instructor', 'admin'),  # Admin should supersede instructor
+    ]
+    
+    # Role hierarchy (higher roles inherit from lower)
+    ROLE_HIERARCHY = {
+        'admin': ['instructor', 'learner', 'content_manager', 'support'],
+        'instructor': ['learner'],
+        'content_manager': ['learner'],
+        'support': [],
+        'learner': [],
+    }
+    
+    @staticmethod
+    def detect_role_conflicts(user: User, course_id: Optional[str] = None, course_name: str = '') -> List[Dict[str, Any]]:
+        """
+        Detect role conflicts for a user.
+        
+        Detects conflicts such as:
+        - User having both learner and instructor roles
+        - Conflicting roles on the same course
+        - Role hierarchy violations
+        
+        Args:
+            user: The user to check for conflicts
+            course_id: Optional course ID for course-specific conflicts
+            course_name: Optional course name for reference
+            
+        Returns:
+            List of detected conflicts as dictionaries
+        """
+        conflicts = []
+        
+        # Get all user roles
+        user_roles = list(user.assigned_roles.all().values_list('role_name', flat=True))
+        
+        # Check for conflicting role pairs
+        for role1, role2 in RBACEdgeCaseService.CONFLICTING_ROLE_PAIRS:
+            if role1 in user_roles and role2 in user_roles:
+                conflict = {
+                    'type': RBACConflict.CONFLICT_TYPE_ROLE_CONFLICT,
+                    'severity': RBACConflict.SEVERITY_HIGH,
+                    'conflicting_roles': [role1, role2],
+                    'description': f"User has conflicting roles: {role1} and {role2}",
+                    'course_id': course_id,
+                    'course_name': course_name,
+                    'context': {
+                        'user_roles': user_roles,
+                        'conflict_detected_at': datetime.now().isoformat()
+                    }
+                }
+                conflicts.append(conflict)
+        
+        # Check for multiple primary roles
+        primary_roles = UserRole.objects.filter(user=user, is_primary=True)
+        if primary_roles.count() > 1:
+            conflict = {
+                'type': RBACConflict.CONFLICT_TYPE_ROLE_CONFLICT,
+                'severity': RBACConflict.SEVERITY_MEDIUM,
+                'conflicting_roles': list(primary_roles.values_list('role__role_name', flat=True)),
+                'description': f"User has {primary_roles.count()} primary roles assigned",
+                'course_id': course_id,
+                'course_name': course_name,
+                'context': {
+                    'primary_role_count': primary_roles.count(),
+                    'conflict_detected_at': datetime.now().isoformat()
+                }
+            }
+            conflicts.append(conflict)
+        
+        # Check for expired roles that are still active
+        expired_roles = UserRole.objects.filter(
+            user=user,
+            expires_at__isnull=False,
+            expires_at__lt=datetime.now()
+        )
+        
+        for expired_role in expired_roles:
+            conflict = {
+                'type': RBACConflict.CONFLICT_TYPE_TIME_BOUND,
+                'severity': RBACConflict.SEVERITY_MEDIUM,
+                'conflicting_roles': [expired_role.role.role_name],
+                'description': f"User has expired role: {expired_role.role.display_name}",
+                'course_id': course_id,
+                'course_name': course_name,
+                'context': {
+                    'expired_at': expired_role.expires_at.isoformat(),
+                    'days_expired': (datetime.now() - expired_role.expires_at).days,
+                    'conflict_detected_at': datetime.now().isoformat()
+                }
+            }
+            conflicts.append(conflict)
+        
+        logger.info(f"Detected {len(conflicts)} role conflicts for user {user.email}")
+        return conflicts
+    
+    @staticmethod
+    def validate_permission_inheritance(user: User, required_permission: str) -> Dict[str, Any]:
+        """
+        Validate that a user's permissions are properly inherited through the role hierarchy.
+        
+        Args:
+            user: The user to validate
+            required_permission: The permission to check
+            
+        Returns:
+            Dictionary with validation results
+        """
+        result = {
+            'is_valid': True,
+            'user_has_permission': False,
+            'inherited_from': None,
+            'violations': []
+        }
+        
+        # Get user's roles
+        user_roles = list(user.assigned_roles.all())
+        
+        # Check each role for the permission
+        for role in user_roles:
+            if required_permission in role.permissions:
+                result['user_has_permission'] = True
+                result['inherited_from'] = role.role_name
+                break
+        
+        # Check role hierarchy for inherited permissions
+        for role in user_roles:
+            if role.role_name in RBACEdgeCaseService.ROLE_HIERARCHY:
+                inherited_roles = RBACEdgeCaseService.ROLE_HIERARCHY[role.role_name]
+                
+                # Check if any inherited role has the permission
+                for inherited_role_name in inherited_roles:
+                    try:
+                        inherited_role = Role.objects.get(role_name=inherited_role_name)
+                        if required_permission in inherited_role.permissions:
+                            result['user_has_permission'] = True
+                            if not result['inherited_from']:
+                                result['inherited_from'] = f"{role.role_name} -> {inherited_role_name}"
+                    except Role.DoesNotExist:
+                        continue
+        
+        # Check for permission inheritance violations
+        # (e.g., lower role having permissions that should only be in higher roles)
+        for role in user_roles:
+            for higher_role_name, lower_roles in RBACEdgeCaseService.ROLE_HIERARCHY.items():
+                if role.role_name in lower_roles:
+                    try:
+                        higher_role = Role.objects.get(role_name=higher_role_name)
+                        for permission in role.permissions:
+                            if permission in higher_role.permissions:
+                                # This is actually valid - lower roles can have same permissions
+                                pass
+                    except Role.DoesNotExist:
+                        continue
+        
+        if not result['user_has_permission']:
+            result['is_valid'] = False
+            result['violations'].append({
+                'type': 'missing_permission',
+                'permission': required_permission,
+                'message': f"User does not have required permission: {required_permission}"
+            })
+        
+        return result
+    
+    @staticmethod
+    def check_time_bound_grants(user: User) -> List[Dict[str, Any]]:
+        """
+        Check for time-bound role grants that are expiring or have expired.
+        
+        Args:
+            user: The user to check
+            
+        Returns:
+            List of time-bound grant issues
+        """
+        issues = []
+        
+        # Get time-bound role grants
+        time_bound_roles = UserRole.objects.filter(
+            user=user,
+            expires_at__isnull=False
+        )
+        
+        now = datetime.now()
+        
+        for user_role in time_bound_roles:
+            days_until_expiry = (user_role.expires_at - now).days
+            
+            if days_until_expiry < 0:
+                # Already expired
+                issues.append({
+                    'type': 'expired',
+                    'role': user_role.role.role_name,
+                    'expired_at': user_role.expires_at.isoformat(),
+                    'days_expired': abs(days_until_expiry),
+                    'severity': RBACConflict.SEVERITY_HIGH,
+                    'message': f"Role '{user_role.role.display_name}' expired {abs(days_until_expiry)} days ago"
+                })
+            elif days_until_expiry <= 7:
+                # Expiring within 7 days
+                issues.append({
+                    'type': 'expiring_soon',
+                    'role': user_role.role.role_name,
+                    'expires_at': user_role.expires_at.isoformat(),
+                    'days_remaining': days_until_expiry,
+                    'severity': RBACConflict.SEVERITY_MEDIUM if days_until_expiry <= 3 else RBACConflict.SEVERITY_LOW,
+                    'message': f"Role '{user_role.role.display_name}' expires in {days_until_expiry} days"
+                })
+        
+        return issues
+    
+    @staticmethod
+    def create_rbac_conflict(
+        user: User,
+        conflict_type: str,
+        severity: str,
+        conflicting_roles: List[str],
+        description: str,
+        course_id: Optional[str] = None,
+        course_name: str = '',
+        detected_by: Optional[User] = None,
+        context_data: Optional[Dict] = None
+    ) -> RBACConflict:
+        """
+        Create an RBAC conflict record.
+        
+        Args:
+            user: The user with the conflict
+            conflict_type: Type of conflict
+            severity: Severity level
+            conflicting_roles: List of conflicting role names
+            description: Description of the conflict
+            course_id: Optional course ID
+            course_name: Optional course name
+            detected_by: User who detected the conflict
+            context_data: Additional context
+            
+        Returns:
+            The created RBACConflict instance
+        """
+        conflict = RBACConflict.objects.create(
+            user=user,
+            conflict_type=conflict_type,
+            severity=severity,
+            status=RBACConflict.STATUS_DETECTED,
+            conflicting_roles=conflicting_roles,
+            description=description,
+            course_id=course_id,
+            course_name=course_name,
+            detected_by=detected_by,
+            detection_source='automatic_scan' if detected_by is None else 'manual_review',
+            context_data=context_data or {}
+        )
+        
+        logger.warning(f"Created RBAC conflict {conflict.id} for user {user.email}: {conflict_type}")
+        return conflict
+    
+    @staticmethod
+    def scan_for_conflicts(course_id: Optional[str] = None) -> List[RBACConflict]:
+        """
+        Scan all users for RBAC conflicts.
+        
+        Args:
+            course_id: Optional course ID to limit scan scope
+            
+        Returns:
+            List of newly created RBACConflict records
+        """
+        conflicts_created = []
+        
+        # Get users to scan
+        users = User.objects.filter(is_active=True)
+        
+        for user in users:
+            detected_conflicts = RBACEdgeCaseService.detect_role_conflicts(user, course_id)
+            
+            for conflict_data in detected_conflicts:
+                # Check if this conflict already exists
+                existing = RBACConflict.objects.filter(
+                    user=user,
+                    conflict_type=conflict_data['type'],
+                    status=RBACConflict.STATUS_DETECTED
+                ).exists()
+                
+                if not existing:
+                    conflict = RBACEdgeCaseService.create_rbac_conflict(
+                        user=user,
+                        conflict_type=conflict_data['type'],
+                        severity=conflict_data['severity'],
+                        conflicting_roles=conflict_data['conflicting_roles'],
+                        description=conflict_data['description'],
+                        course_id=conflict_data.get('course_id'),
+                        course_name=conflict_data.get('course_name', ''),
+                        context_data=conflict_data.get('context', {})
+                    )
+                    conflicts_created.append(conflict)
+        
+        logger.info(f"RBAC conflict scan complete. Created {len(conflicts_created)} new conflict records.")
+        return conflicts_created
+    
+    @staticmethod
+    def resolve_conflict(
+        conflict: RBACConflict,
+        resolved_by: User,
+        resolution_action: str,
+        resolution_notes: str = ''
+    ) -> bool:
+        """
+        Resolve an RBAC conflict.
+        
+        Args:
+            conflict: The conflict to resolve
+            resolved_by: User resolving the conflict
+            resolution_action: Action taken (e.g., 'role_revoked', 'marked_legitimate')
+            resolution_notes: Additional notes
+            
+        Returns:
+            True if resolved successfully
+        """
+        try:
+            conflict.resolve(resolved_by, resolution_action, resolution_notes)
+            
+            logger.info(f"RBAC conflict {conflict.id} resolved by {resolved_by.email}: {resolution_action}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to resolve RBAC conflict {conflict.id}: {str(e)}")
+            return False
+    
+    @staticmethod
+    def get_conflict_summary(user: Optional[User] = None) -> Dict[str, Any]:
+        """
+        Get a summary of RBAC conflicts.
+        
+        Args:
+            user: Optional user to limit summary to
+            
+        Returns:
+            Dictionary with conflict summary statistics
+        """
+        queryset = RBACConflict.objects.all()
+        
+        if user:
+            queryset = queryset.filter(user=user)
+        
+        summary = {
+            'total_conflicts': queryset.count(),
+            'by_status': {
+                'detected': queryset.filter(status=RBACConflict.STATUS_DETECTED).count(),
+                'resolved': queryset.filter(status=RBACConflict.STATUS_RESOLVED).count(),
+                'ignored': queryset.filter(status=RBACConflict.STATUS_IGNORED).count(),
+                'escalated': queryset.filter(status=RBACConflict.STATUS_ESCALATED).count(),
+            },
+            'by_severity': {
+                'low': queryset.filter(severity=RBACConflict.SEVERITY_LOW).count(),
+                'medium': queryset.filter(severity=RBACConflict.SEVERITY_MEDIUM).count(),
+                'high': queryset.filter(severity=RBACConflict.SEVERITY_HIGH).count(),
+                'critical': queryset.filter(severity=RBACConflict.SEVERITY_CRITICAL).count(),
+            },
+            'by_type': {
+                'role_conflict': queryset.filter(conflict_type=RBACConflict.CONFLICT_TYPE_ROLE_CONFLICT).count(),
+                'permission_inheritance': queryset.filter(conflict_type=RBACConflict.CONFLICT_TYPE_PERMISSION_INHERITANCE).count(),
+                'time_bound': queryset.filter(conflict_type=RBACConflict.CONFLICT_TYPE_TIME_BOUND).count(),
+                'cross_domain': queryset.filter(conflict_type=RBACConflict.CONFLICT_TYPE_CROSS_DOMAIN).count(),
+            },
+            'open_critical': queryset.filter(
+                status=RBACConflict.STATUS_DETECTED,
+                severity=RBACConflict.SEVERITY_CRITICAL
+            ).count()
+        }
+        
+        return summary

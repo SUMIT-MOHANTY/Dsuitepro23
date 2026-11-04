@@ -365,3 +365,226 @@ class UserSession(TimestampedModel):
     def is_active(self):
         """Check if this session is active (not revoked and not expired)."""
         return not self.is_revoked and not self.is_expired()
+
+
+class RBACConflict(TimestampedModel):
+    """
+    Model for tracking RBAC role conflicts detected in the system.
+    Used for SOC 2 compliance and security auditing.
+    
+    Tracks conflicts such as:
+    - User having both learner and instructor roles on the same course
+    - Permission inheritance violations
+    - Time-bound role grant conflicts
+    """
+    
+    # Conflict Types
+    CONFLICT_TYPE_ROLE_CONFLICT = 'role_conflict'
+    CONFLICT_TYPE_PERMISSION_INHERITANCE = 'permission_inheritance'
+    CONFLICT_TYPE_TIME_BOUND = 'time_bound_grant'
+    CONFLICT_TYPE_CROSS_DOMAIN = 'cross_domain'
+    
+    CONFLICT_TYPE_CHOICES = [
+        (CONFLICT_TYPE_ROLE_CONFLICT, _('Role Conflict')),
+        (CONFLICT_TYPE_PERMISSION_INHERITANCE, _('Permission Inheritance Violation')),
+        (CONFLICT_TYPE_TIME_BOUND, _('Time-Bound Grant Conflict')),
+        (CONFLICT_TYPE_CROSS_DOMAIN, _('Cross-Domain Conflict')),
+    ]
+    
+    # Conflict Status
+    STATUS_DETECTED = 'detected'
+    STATUS_RESOLVED = 'resolved'
+    STATUS_IGNORED = 'ignored'
+    STATUS_ESCALATED = 'escalated'
+    
+    STATUS_CHOICES = [
+        (STATUS_DETECTED, _('Detected')),
+        (STATUS_RESOLVED, _('Resolved')),
+        (STATUS_IGNORED, _('Ignored')),
+        (STATUS_ESCALATED, _('Escalated')),
+    ]
+    
+    # Severity Levels
+    SEVERITY_LOW = 'low'
+    SEVERITY_MEDIUM = 'medium'
+    SEVERITY_HIGH = 'high'
+    SEVERITY_CRITICAL = 'critical'
+    
+    SEVERITY_CHOICES = [
+        (SEVERITY_LOW, _('Low')),
+        (SEVERITY_MEDIUM, _('Medium')),
+        (SEVERITY_HIGH, _('High')),
+        (SEVERITY_CRITICAL, _('Critical')),
+    ]
+    
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='rbac_conflicts',
+        help_text="User involved in the conflict"
+    )
+    
+    # Conflict Details
+    conflict_type = models.CharField(
+        _('conflict type'),
+        max_length=50,
+        choices=CONFLICT_TYPE_CHOICES,
+        default=CONFLICT_TYPE_ROLE_CONFLICT,
+        help_text="Type of RBAC conflict detected"
+    )
+    severity = models.CharField(
+        _('severity'),
+        max_length=20,
+        choices=SEVERITY_CHOICES,
+        default=SEVERITY_MEDIUM,
+        help_text="Severity level of the conflict"
+    )
+    status = models.CharField(
+        _('status'),
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default=STATUS_DETECTED,
+        help_text="Current status of the conflict"
+    )
+    
+    # Course Context (optional - for course-specific conflicts)
+    course_id = models.UUIDField(
+        _('course ID'),
+        null=True,
+        blank=True,
+        help_text="Course ID if conflict is course-specific"
+    )
+    course_name = models.CharField(
+        _('course name'),
+        max_length=255,
+        blank=True,
+        help_text="Name of the course (for reference)"
+    )
+    
+    # Conflicting Roles (stored as JSON array of role names)
+    conflicting_roles = models.JSONField(
+        _('conflicting roles'),
+        default=list,
+        help_text="List of conflicting role names"
+    )
+    
+    # Conflict Description
+    description = models.TextField(
+        _('description'),
+        help_text="Detailed description of the conflict"
+    )
+    
+    # Detection Metadata
+    detected_at = models.DateTimeField(
+        _('detected at'),
+        auto_now_add=True,
+        help_text="When the conflict was detected"
+    )
+    detected_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='conflicts_detected',
+        help_text="User or system that detected the conflict"
+    )
+    detection_source = models.CharField(
+        _('detection source'),
+        max_length=100,
+        blank=True,
+        help_text="Source of detection (e.g., 'automatic_scan', 'manual_review')"
+    )
+    
+    # Resolution
+    resolved_at = models.DateTimeField(
+        _('resolved at'),
+        null=True,
+        blank=True,
+        help_text="When the conflict was resolved"
+    )
+    resolved_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='conflicts_resolved',
+        help_text="User who resolved the conflict"
+    )
+    resolution_notes = models.TextField(
+        _('resolution notes'),
+        blank=True,
+        help_text="Notes about how the conflict was resolved"
+    )
+    resolution_action = models.CharField(
+        _('resolution action'),
+        max_length=100,
+        blank=True,
+        help_text="Action taken to resolve (e.g., 'role_revoked', 'marked_legitimate')"
+    )
+    
+    # Additional Context
+    context_data = models.JSONField(
+        _('context data'),
+        default=dict,
+        blank=True,
+        help_text="Additional context about the conflict"
+    )
+    
+    class Meta:
+        verbose_name = _('RBAC Conflict')
+        verbose_name_plural = _('RBAC Conflicts')
+        ordering = ['-detected_at']
+        indexes = [
+            models.Index(fields=['user', 'status', 'detected_at']),
+            models.Index(fields=['conflict_type', 'severity', 'status']),
+            models.Index(fields=['course_id', 'status']),
+            models.Index(fields=['detected_at', 'status']),
+        ]
+    
+    def __str__(self):
+        return f"{self.conflict_type} for {self.user.email} ({self.status})"
+    
+    def resolve(self, resolved_by, resolution_action='', resolution_notes=''):
+        """
+        Mark this conflict as resolved.
+        
+        Args:
+            resolved_by: User who resolved the conflict
+            resolution_action: Action taken to resolve
+            resolution_notes: Additional notes about resolution
+        """
+        self.status = self.STATUS_RESOLVED
+        self.resolved_at = datetime.now()
+        self.resolved_by = resolved_by
+        self.resolution_action = resolution_action
+        self.resolution_notes = resolution_notes
+        self.save(update_fields=[
+            'status', 'resolved_at', 'resolved_by',
+            'resolution_action', 'resolution_notes'
+        ])
+    
+    def escalate(self, notes=''):
+        """Escalate this conflict for higher-level review."""
+        self.status = self.STATUS_ESCALATED
+        if notes:
+            self.resolution_notes = notes
+        self.save(update_fields=['status', 'resolution_notes'])
+    
+    def ignore(self, notes=''):
+        """Mark this conflict as ignored (e.g., legitimate use case)."""
+        self.status = self.STATUS_IGNORED
+        if notes:
+            self.resolution_notes = notes
+        self.save(update_fields=['status', 'resolution_notes'])
+    
+    @property
+    def is_resolved(self):
+        """Check if this conflict has been resolved."""
+        return self.status == self.STATUS_RESOLVED
+    
+    @property
+    def days_open(self):
+        """Calculate how many days this conflict has been open."""
+        if self.is_resolved and self.resolved_at:
+            return (self.resolved_at - self.detected_at).days
+        return (datetime.now() - self.detected_at).days

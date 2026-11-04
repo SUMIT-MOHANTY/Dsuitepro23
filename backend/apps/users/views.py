@@ -17,7 +17,7 @@ from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from apps.core.exceptions import ValidationError, NotFoundError, AuthenticationError
 
-from .models import Role, UserRole, UserSession
+from .models import Role, UserRole, UserSession, RBACConflict
 from .permissions import IsSelfOrAdmin, CanImpersonate
 from .serializers import (
     CustomTokenObtainPairSerializer,
@@ -35,6 +35,8 @@ from .serializers import (
     UserListSerializer,
     UserSessionSerializer,
     UserUpdateSerializer,
+    RBACConflictSerializer,
+    RBACConflictResolveSerializer,
 )
 from .services import (
     AuthenticationService,
@@ -43,6 +45,7 @@ from .services import (
     PasswordResetService,
     SessionService,
     UserManagementService,
+    RBACEdgeCaseService,
 )
 
 User = get_user_model()
@@ -718,6 +721,175 @@ class SessionViewSet(viewsets.ViewSet):
             return Response(
                 {'code': 'NOT_FOUND', 'detail': 'Session not found.'},
                 status=status.HTTP_404_NOT_FOUND
+            )
+
+
+class RBACConflictViewSet(viewsets.ModelViewSet):
+    """
+    RBAC Conflict management ViewSet.
+    Provides endpoints for listing and resolving RBAC conflicts.
+    """
+    queryset = RBACConflict.objects.all()
+    serializer_class = RBACConflictSerializer
+    permission_classes = [IsAuthenticated, IsAdminUser]
+    
+    def get_queryset(self):
+        """Filter conflicts based on query parameters."""
+        queryset = RBACConflict.objects.all()
+        
+        # Filter by status
+        status_param = self.request.query_params.get('status')
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+        
+        # Filter by severity
+        severity = self.request.query_params.get('severity')
+        if severity:
+            queryset = queryset.filter(severity=severity)
+        
+        # Filter by conflict type
+        conflict_type = self.request.query_params.get('conflict_type')
+        if conflict_type:
+            queryset = queryset.filter(conflict_type=conflict_type)
+        
+        # Filter by user
+        user_id = self.request.query_params.get('user_id')
+        if user_id:
+            queryset = queryset.filter(user_id=user_id)
+        
+        # Filter by course
+        course_id = self.request.query_params.get('course_id')
+        if course_id:
+            queryset = queryset.filter(course_id=course_id)
+        
+        return queryset.select_related('user', 'detected_by', 'resolved_by')
+    
+    @action(detail=False, methods=['get'], url_path='summary')
+    def summary(self, request):
+        """
+        Get RBAC conflict summary statistics.
+        GET /api/v1/users/rbac-conflicts/summary/
+        """
+        from django.db.models import Count, Q
+        
+        summary = {
+            'total': RBACConflict.objects.count(),
+            'by_status': dict(RBACConflict.objects.values_list('status').annotate(count=Count('id'))),
+            'by_severity': dict(RBACConflict.objects.values_list('severity').annotate(count=Count('id'))),
+            'by_type': dict(RBACConflict.objects.values_list('conflict_type').annotate(count=Count('id'))),
+            'open_critical': RBACConflict.objects.filter(
+                status=RBACConflict.STATUS_DETECTED,
+                severity=RBACConflict.SEVERITY_CRITICAL
+            ).count(),
+            'open_high': RBACConflict.objects.filter(
+                status=RBACConflict.STATUS_DETECTED,
+                severity=RBACConflict.SEVERITY_HIGH
+            ).count(),
+        }
+        
+        return Response(summary)
+    
+    @action(detail=False, methods=['post'], url_path='scan')
+    def scan(self, request):
+        """
+        Trigger RBAC conflict scan.
+        POST /api/v1/users/rbac-conflicts/scan/
+        """
+        try:
+            results = RBACEdgeCaseService.scan_all_conflicts(detected_by=request.user)
+            return Response({
+                'detail': f'Scan completed. {len(results)} conflicts detected.',
+                'conflicts_detected': len(results),
+                'conflicts': RBACConflictSerializer(results, many=True).data
+            })
+        except Exception as e:
+            logger.error(f"RBAC scan error: {str(e)}")
+            return Response(
+                {'code': 'SCAN_FAILED', 'detail': 'Failed to scan for conflicts.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=True, methods=['post'], url_path='resolve')
+    def resolve(self, request, pk=None):
+        """
+        Resolve an RBAC conflict.
+        POST /api/v1/users/rbac-conflicts/{id}/resolve/
+        """
+        conflict = self.get_object()
+        
+        serializer = RBACConflictResolveSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {
+                    'code': 'VALIDATION_ERROR',
+                    'detail': 'Invalid resolution data.',
+                    'field_errors': serializer.errors
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            conflict.resolve(
+                resolved_by=request.user,
+                resolution_action=serializer.validated_data.get('resolution_action', ''),
+                resolution_notes=serializer.validated_data.get('resolution_notes', '')
+            )
+            
+            logger.info(f"RBAC conflict {pk} resolved by {request.user.email}")
+            
+            return Response(RBACConflictSerializer(conflict).data)
+            
+        except Exception as e:
+            logger.error(f"Conflict resolution error: {str(e)}")
+            return Response(
+                {'code': 'RESOLUTION_FAILED', 'detail': 'Failed to resolve conflict.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=True, methods=['post'], url_path='escalate')
+    def escalate(self, request, pk=None):
+        """
+        Escalate an RBAC conflict.
+        POST /api/v1/users/rbac-conflicts/{id}/escalate/
+        """
+        conflict = self.get_object()
+        notes = request.data.get('notes', '')
+        
+        try:
+            conflict.escalate(notes=notes)
+            
+            logger.info(f"RBAC conflict {pk} escalated by {request.user.email}")
+            
+            return Response(RBACConflictSerializer(conflict).data)
+            
+        except Exception as e:
+            logger.error(f"Conflict escalation error: {str(e)}")
+            return Response(
+                {'code': 'ESCALATION_FAILED', 'detail': 'Failed to escalate conflict.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=True, methods=['post'], url_path='ignore')
+    def ignore(self, request, pk=None):
+        """
+        Ignore an RBAC conflict (mark as legitimate).
+        POST /api/v1/users/rbac-conflicts/{id}/ignore/
+        """
+        conflict = self.get_object()
+        notes = request.data.get('notes', '')
+        
+        try:
+            conflict.ignore(notes=notes)
+            
+            logger.info(f"RBAC conflict {pk} ignored by {request.user.email}")
+            
+            return Response(RBACConflictSerializer(conflict).data)
+            
+        except Exception as e:
+            logger.error(f"Conflict ignore error: {str(e)}")
+            return Response(
+                {'code': 'IGNORE_FAILED', 'detail': 'Failed to ignore conflict.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
 
