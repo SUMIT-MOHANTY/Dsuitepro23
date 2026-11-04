@@ -33,12 +33,16 @@ urlpatterns = [
         # Assessment app endpoints (quizzes, assignments, grading)
         path('assessments/', include('apps.assessment.urls', namespace='assessment')),
         
+        # Forum app endpoints (discussion forums and posts)
+        path('forums/', include('apps.forum.urls', namespace='forum')),
+        
+        # Notifications app endpoints (notifications and preferences)
+        path('notifications/', include('apps.notifications.urls', namespace='notifications')),
+        
         # Domain app endpoints (to be implemented by domain agents)
         # path('enrollments/', include('apps.enrollment.urls', namespace='enrollment')),
         # path('certificates/', include('apps.certificates.urls', namespace='certificates')),
         # path('scorm/', include('apps.scorm.urls', namespace='scorm')),
-        # path('forum/', include('apps.forum.urls', namespace='forum')),
-        # path('notifications/', include('apps.notifications.urls', namespace='notifications')),
         # path('analytics/', include('apps.analytics.urls', namespace='analytics')),
         # path('calendar/', include('apps.calendar.urls', namespace='calendar')),
     ])),
