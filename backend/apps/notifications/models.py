@@ -1,6 +1,7 @@
 """
 Notifications Models for Enterprise LMS
-Provides Notification model for email and in-app notifications.
+Provides Notification model for email and in-app notifications with delivery tracking,
+idempotency, dead letter queue, and comprehensive audit logging.
 """
 
 import uuid
@@ -16,10 +17,22 @@ User = get_user_model()
 class Notification(TimestampedModel):
     """
     Model representing a notification for a user.
-    Supports email, in-app, and push notification types with delivery tracking.
+    Supports email, in-app, and push notification types with delivery tracking,
+    idempotency keys, and retry logic for production reliability.
     """
     
-    # Notification Type Choices
+    # Notification Channel Choices
+    CHANNEL_EMAIL = 'email'
+    CHANNEL_IN_APP = 'in_app'
+    CHANNEL_PUSH = 'push'
+    
+    CHANNEL_CHOICES = [
+        (CHANNEL_EMAIL, _('Email')),
+        (CHANNEL_IN_APP, _('In-App')),
+        (CHANNEL_PUSH, _('Push')),
+    ]
+    
+    # Notification Type Choices (legacy - use channel)
     TYPE_EMAIL = 'email'
     TYPE_IN_APP = 'in_app'
     TYPE_PUSH = 'push'
@@ -51,12 +64,15 @@ class Notification(TimestampedModel):
         (CATEGORY_SYSTEM, _('System')),
     ]
     
-    # Status Choices
+    # Status Choices - Extended for delivery tracking
     STATUS_PENDING = 'pending'
     STATUS_SENT = 'sent'
     STATUS_DELIVERED = 'delivered'
     STATUS_FAILED = 'failed'
     STATUS_READ = 'read'
+    STATUS_DEFERRED = 'deferred'
+    STATUS_BOUNCED = 'bounced'
+    STATUS_COMPLAINED = 'complained'
     
     STATUS_CHOICES = [
         (STATUS_PENDING, _('Pending')),
@@ -64,6 +80,9 @@ class Notification(TimestampedModel):
         (STATUS_DELIVERED, _('Delivered')),
         (STATUS_FAILED, _('Failed')),
         (STATUS_READ, _('Read')),
+        (STATUS_DEFERRED, _('Deferred')),
+        (STATUS_BOUNCED, _('Bounced')),
+        (STATUS_COMPLAINED, _('Complained')),
     ]
     
     # Priority Choices
@@ -85,13 +104,25 @@ class Notification(TimestampedModel):
         related_name='notifications',
         help_text=_("User who receives the notification")
     )
+    
+    # Channel (new field for hardened service)
+    channel = models.CharField(
+        max_length=20,
+        choices=CHANNEL_CHOICES,
+        default=CHANNEL_IN_APP,
+        db_index=True,
+        help_text=_("Delivery channel for this notification")
+    )
+    
+    # Legacy notification_type field (for backward compatibility)
     notification_type = models.CharField(
         max_length=20,
         choices=NOTIFICATION_TYPES,
         default=TYPE_IN_APP,
         db_index=True,
-        help_text=_("Type of notification")
+        help_text=_("Type of notification (legacy, use channel)")
     )
+    
     category = models.CharField(
         max_length=50,
         choices=CATEGORY_CHOICES,
@@ -134,6 +165,8 @@ class Notification(TimestampedModel):
         blank=True,
         help_text=_("URL to navigate to when notification is clicked")
     )
+    
+    # Delivery tracking timestamps
     sent_at = models.DateTimeField(
         null=True,
         blank=True,
@@ -150,13 +183,64 @@ class Notification(TimestampedModel):
         blank=True,
         help_text=_("When the notification was read")
     )
+    
+    # Idempotency and retry tracking (new fields for hardened service)
+    idempotency_key = models.CharField(
+        max_length=64,
+        db_index=True,
+        blank=True,
+        default='',
+        help_text=_("Unique key for deduplication (24-hour window)")
+    )
+    delivery_attempts = models.PositiveIntegerField(
+        default=0,
+        help_text=_("Number of delivery attempts made")
+    )
+    last_attempt_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=_("When the last delivery attempt was made")
+    )
+    scheduled_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text=_("When the notification should be delivered (for scheduled notifications)")
+    )
+    
+    # Error tracking
     error_message = models.TextField(
         blank=True,
         help_text=_("Error message if delivery failed")
     )
     retry_count = models.PositiveIntegerField(
         default=0,
-        help_text=_("Number of retry attempts for failed notifications")
+        help_text=_("Number of retry attempts for failed notifications (legacy)")
+    )
+    
+    # Email-specific fields
+    email_subject = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text=_("Email subject line (for email notifications)")
+    )
+    email_template = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text=_("Template used for email rendering")
+    )
+    
+    # Provider tracking
+    provider = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text=_("Email provider used (sendgrid, aws_ses, smtp)")
+    )
+    provider_message_id = models.CharField(
+        max_length=255,
+        blank=True,
+        db_index=True,
+        help_text=_("Message ID from email provider")
     )
     
     class Meta:
@@ -168,10 +252,15 @@ class Notification(TimestampedModel):
             models.Index(fields=['user', 'status', '-created_at']),
             models.Index(fields=['category', '-created_at']),
             models.Index(fields=['notification_type', 'status']),
+            models.Index(fields=['channel', 'status']),
+            models.Index(fields=['idempotency_key', 'created_at']),
+            models.Index(fields=['scheduled_at', 'status']),
+            models.Index(fields=['provider_message_id']),
+            models.Index(fields=['delivery_attempts', 'status']),
         ]
     
     def __str__(self):
-        return f"{self.notification_type} - {self.title}"
+        return f"{self.channel} - {self.title}"
     
     def mark_as_read(self):
         """Mark notification as read."""
@@ -202,10 +291,224 @@ class Notification(TimestampedModel):
         self.error_message = error_message
         self.save(update_fields=['status', 'error_message', 'updated_at'])
     
+    def mark_as_bounced(self, error_message=''):
+        """Mark notification as bounced."""
+        from django.utils import timezone
+        self.status = self.STATUS_BOUNCED
+        self.error_message = error_message
+        self.delivered_at = timezone.now()
+        self.save(update_fields=['status', 'error_message', 'delivered_at', 'updated_at'])
+    
+    def mark_as_complained(self):
+        """Mark notification as complained (spam complaint)."""
+        from django.utils import timezone
+        self.status = self.STATUS_COMPLAINED
+        self.delivered_at = timezone.now()
+        self.save(update_fields=['status', 'delivered_at', 'updated_at'])
+    
     def increment_retry(self):
-        """Increment retry count."""
+        """Increment retry count (legacy)."""
         self.retry_count += 1
         self.save(update_fields=['retry_count', 'updated_at'])
+    
+    def record_attempt(self, error_message=''):
+        """Record a delivery attempt."""
+        from django.utils import timezone
+        self.delivery_attempts += 1
+        self.last_attempt_at = timezone.now()
+        if error_message:
+            self.error_message = error_message
+        self.save(update_fields=['delivery_attempts', 'last_attempt_at', 'error_message', 'updated_at'])
+    
+    def should_retry(self, max_attempts=5):
+        """Check if notification should be retried."""
+        return self.delivery_attempts < max_attempts and self.status in [
+            self.STATUS_FAILED, self.STATUS_DEFERRED, self.STATUS_PENDING
+        ]
+    
+    def get_next_retry_delay(self):
+        """Calculate exponential backoff delay (2^attempt * 60s with jitter)."""
+        import random
+        base_delay = (2 ** self.delivery_attempts) * 60
+        jitter = random.uniform(0, 0.1 * base_delay)  # 10% jitter
+        return int(base_delay + jitter)
+
+
+class NotificationDLQ(TimestampedModel):
+    """
+    Dead Letter Queue for failed notifications.
+    Stores notifications that exceeded max retry attempts for manual review.
+    """
+    
+    # DLQ Status Choices
+    STATUS_PENDING_REVIEW = 'pending_review'
+    STATUS_REQUEUED = 'requeued'
+    STATUS_DISCARDED = 'discarded'
+    STATUS_RESOLVED = 'resolved'
+    
+    STATUS_CHOICES = [
+        (STATUS_PENDING_REVIEW, _('Pending Review')),
+        (STATUS_REQUEUED, _('Requeued')),
+        (STATUS_DISCARDED, _('Discarded')),
+        (STATUS_RESOLVED, _('Resolved')),
+    ]
+    
+    # Original notification reference
+    original_notification = models.OneToOneField(
+        Notification,
+        on_delete=models.CASCADE,
+        related_name='dlq_entry',
+        help_text=_("Original notification that failed")
+    )
+    
+    # DLQ tracking
+    failed_at = models.DateTimeField(
+        auto_now_add=True,
+        db_index=True,
+        help_text=_("When the notification entered DLQ")
+    )
+    error_message = models.TextField(
+        help_text=_("Final error message that caused DLQ entry")
+    )
+    attempt_count = models.PositiveIntegerField(
+        help_text=_("Number of delivery attempts before DLQ")
+    )
+    
+    # Payload preservation
+    payload = models.JSONField(
+        default=dict,
+        help_text=_("Complete notification payload for reprocessing")
+    )
+    
+    # DLQ management
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default=STATUS_PENDING_REVIEW,
+        db_index=True,
+        help_text=_("Current DLQ status")
+    )
+    reviewed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=_("When the DLQ entry was reviewed")
+    )
+    reviewed_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='dlq_reviews',
+        help_text=_("User who reviewed this DLQ entry")
+    )
+    resolution_notes = models.TextField(
+        blank=True,
+        help_text=_("Notes about resolution")
+    )
+    
+    class Meta:
+        verbose_name = _("Notification DLQ Entry")
+        verbose_name_plural = _("Notification DLQ Entries")
+        ordering = ['-failed_at']
+        indexes = [
+            models.Index(fields=['status', 'failed_at']),
+            models.Index(fields=['original_notification']),
+        ]
+    
+    def __str__(self):
+        return f"DLQ: {self.original_notification.title}"
+    
+    def mark_as_requeued(self, reviewed_by=None):
+        """Mark DLQ entry as requeued."""
+        from django.utils import timezone
+        self.status = self.STATUS_REQUEUED
+        self.reviewed_at = timezone.now()
+        self.reviewed_by = reviewed_by
+        self.save(update_fields=['status', 'reviewed_at', 'reviewed_by', 'updated_at'])
+    
+    def mark_as_discarded(self, reviewed_by=None, notes=''):
+        """Mark DLQ entry as discarded."""
+        from django.utils import timezone
+        self.status = self.STATUS_DISCARDED
+        self.reviewed_at = timezone.now()
+        self.reviewed_by = reviewed_by
+        self.resolution_notes = notes
+        self.save(update_fields=['status', 'reviewed_at', 'reviewed_by', 'resolution_notes', 'updated_at'])
+    
+    def mark_as_resolved(self, reviewed_by=None, notes=''):
+        """Mark DLQ entry as resolved."""
+        from django.utils import timezone
+        self.status = self.STATUS_RESOLVED
+        self.reviewed_at = timezone.now()
+        self.reviewed_by = reviewed_by
+        self.resolution_notes = notes
+        self.save(update_fields=['status', 'reviewed_at', 'reviewed_by', 'resolution_notes', 'updated_at'])
+
+
+class NotificationDeliveryLog(TimestampedModel):
+    """
+    Detailed delivery log for each notification attempt.
+    Provides audit trail for SOC 2 compliance.
+    """
+    
+    # Attempt Status Choices
+    STATUS_SUCCESS = 'success'
+    STATUS_FAILED = 'failed'
+    STATUS_RETRY = 'retry'
+    STATUS_SKIPPED = 'skipped'
+    
+    STATUS_CHOICES = [
+        (STATUS_SUCCESS, _('Success')),
+        (STATUS_FAILED, _('Failed')),
+        (STATUS_RETRY, _('Retry')),
+        (STATUS_SKIPPED, _('Skipped')),
+    ]
+    
+    notification = models.ForeignKey(
+        Notification,
+        on_delete=models.CASCADE,
+        related_name='delivery_logs',
+        help_text=_("Notification being delivered")
+    )
+    attempt_number = models.PositiveIntegerField(
+        help_text=_("Attempt number (1-indexed)")
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        help_text=_("Result of this delivery attempt")
+    )
+    error_details = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_("Detailed error information")
+    )
+    webhook_response = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_("Response from webhook callbacks")
+    )
+    provider_response = models.TextField(
+        blank=True,
+        help_text=_("Raw response from email provider")
+    )
+    duration_ms = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=_("Request duration in milliseconds")
+    )
+    
+    class Meta:
+        verbose_name = _("Notification Delivery Log")
+        verbose_name_plural = _("Notification Delivery Logs")
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['notification', 'attempt_number']),
+            models.Index(fields=['status', 'created_at']),
+        ]
+    
+    def __str__(self):
+        return f"Attempt {self.attempt_number} for {self.notification.id}"
 
 
 class NotificationPreference(TimestampedModel):
@@ -351,17 +654,24 @@ class NotificationPreference(TimestampedModel):
         
         now = datetime.now(tz).time()
         
-        if self.quiet_hours_start < self.quiet_hours_end:
+        if self.quiet_hours_start <= self.quiet_hours_end:
             return self.quiet_hours_start <= now <= self.quiet_hours_end
         else:
-            # Quiet hours span midnight
+            # Crosses midnight
             return now >= self.quiet_hours_start or now <= self.quiet_hours_end
     
-    def should_send_email(self, category=CATEGORY_GENERAL):
-        """Check if email should be sent based on preferences."""
-        if not self.email_enabled:
-            return False
-        
+    def should_send_channel(self, channel):
+        """Check if a channel is enabled for this user."""
+        if channel == Notification.CHANNEL_EMAIL:
+            return self.email_enabled
+        elif channel == Notification.CHANNEL_IN_APP:
+            return self.in_app_enabled
+        elif channel == Notification.CHANNEL_PUSH:
+            return self.push_enabled
+        return True
+    
+    def should_send_category(self, category):
+        """Check if a category is enabled for this user."""
         category_map = {
             Notification.CATEGORY_COURSE: self.notify_on_course_updates,
             Notification.CATEGORY_ASSIGNMENT: self.notify_on_assignments,
@@ -369,471 +679,109 @@ class NotificationPreference(TimestampedModel):
             Notification.CERTIFICATE: self.notify_on_certificates,
             Notification.CATEGORY_ENROLLMENT: self.notify_on_enrollments,
         }
-        
         return category_map.get(category, True)
-    
-    def should_send_in_app(self, category=CATEGORY_GENERAL):
-        """Check if in-app notification should be sent."""
-        return self.in_app_enabled
-    
-    def should_send_push(self, category=CATEGORY_GENERAL):
-        """Check if push notification should be sent."""
-        return self.push_enabled and len(self.push_device_tokens) > 0
-    
-    def is_subscribed_to_topic(self, topic):
-        """Check if user is subscribed to a specific topic."""
-        return topic in self.subscribed_topics
-    
-    def subscribe_to_topic(self, topic):
-        """Subscribe user to a topic."""
-        if topic not in self.subscribed_topics:
-            self.subscribed_topics.append(topic)
-            self.save(update_fields=['subscribed_topics', 'updated_at'])
-    
-    def unsubscribe_from_topic(self, topic):
-        """Unsubscribe user from a topic."""
-        if topic in self.subscribed_topics:
-            self.subscribed_topics.remove(topic)
-            self.save(update_fields=['subscribed_topics', 'updated_at'])
 
 
 class PushSubscription(TimestampedModel):
     """
-    Model representing a push notification subscription for a user device.
-    Supports Web Push API, FCM (Android), and APNs (iOS).
+    Push notification subscription for a user device.
     """
     
-    # Platform Choices
-    PLATFORM_WEB = 'web'
-    PLATFORM_ANDROID = 'android'
-    PLATFORM_IOS = 'ios'
-    
-    PLATFORM_CHOICES = [
-        (PLATFORM_WEB, _('Web')),
-        (PLATFORM_ANDROID, _('Android')),
-        (PLATFORM_IOS, _('iOS')),
-    ]
-    
-    # Status Choices
-    STATUS_ACTIVE = 'active'
-    STATUS_INACTIVE = 'inactive'
-    STATUS_EXPIRED = 'expired'
-    STATUS_REVOKED = 'revoked'
-    
-    STATUS_CHOICES = [
-        (STATUS_ACTIVE, _('Active')),
-        (STATUS_INACTIVE, _('Inactive')),
-        (STATUS_EXPIRED, _('Expired')),
-        (STATUS_REVOKED, _('Revoked')),
-    ]
-    
-    id = models.UUIDField(
-        primary_key=True,
-        default=uuid.uuid4,
-        editable=False
-    )
     user = models.ForeignKey(
         User,
         on_delete=models.CASCADE,
         related_name='push_subscriptions',
         help_text=_("User who owns this subscription")
     )
-    platform = models.CharField(
-        max_length=20,
-        choices=PLATFORM_CHOICES,
-        db_index=True,
-        help_text=_("Platform type (web, android, ios)")
-    )
-    
-    # Device identification
-    device_token = models.CharField(
-        max_length=500,
-        blank=True,
-        help_text=_("Device token for FCM (Android) or APNs (iOS)")
-    )
-    device_name = models.CharField(
-        max_length=255,
-        blank=True,
-        help_text=_("Human-readable device name")
-    )
-    device_id = models.CharField(
-        max_length=255,
-        blank=True,
-        help_text=_("Unique device identifier")
-    )
-    
-    # Web Push API fields
     endpoint = models.URLField(
-        max_length=500,
-        blank=True,
-        help_text=_("Web Push endpoint URL")
+        help_text=_("Push service endpoint URL")
     )
     p256dh = models.CharField(
         max_length=255,
-        blank=True,
-        help_text=_("P256DH key for Web Push encryption")
+        help_text=_("P256DH key for encryption")
     )
     auth = models.CharField(
         max_length=255,
-        blank=True,
-        help_text=_("Auth key for Web Push encryption")
+        help_text=_("Auth secret for encryption")
     )
-    
-    # VAPID key reference for Web Push
-    vapid_key_id = models.CharField(
-        max_length=255,
+    device_info = models.JSONField(
+        default=dict,
         blank=True,
-        help_text=_("Reference to VAPID key used for this subscription")
+        help_text=_("Device information (browser, OS, etc.)")
     )
-    
-    # Status and expiration
-    status = models.CharField(
-        max_length=20,
-        choices=STATUS_CHOICES,
-        default=STATUS_ACTIVE,
+    is_active = models.BooleanField(
+        default=True,
         db_index=True,
-        help_text=_("Current subscription status")
+        help_text=_("Whether this subscription is active")
     )
-    expires_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text=_("When the subscription expires")
-    )
-    
-    # User agent and IP for tracking
-    user_agent = models.TextField(
-        blank=True,
-        help_text=_("User agent string of the subscribing device")
-    )
-    ip_address = models.GenericIPAddressField(
-        null=True,
-        blank=True,
-        help_text=_("IP address when subscription was created")
-    )
-    
-    # Last used timestamp
     last_used_at = models.DateTimeField(
         null=True,
         blank=True,
-        help_text=_("When this subscription was last used to send a notification")
+        help_text=_("When this subscription was last used")
     )
     
     class Meta:
         verbose_name = _("Push Subscription")
         verbose_name_plural = _("Push Subscriptions")
-        ordering = ['-created_at']
-        indexes = [
-            models.Index(fields=['user', 'platform', 'status']),
-            models.Index(fields=['device_token', 'platform']),
-            models.Index(fields=['status', 'expires_at']),
-        ]
-        unique_together = [
-            ['user', 'device_token', 'platform'],
-        ]
+        unique_together = ['user', 'endpoint']
     
     def __str__(self):
-        return f"{self.platform} - {self.device_name or self.device_id[:20]}"
-    
-    def is_valid(self):
-        """Check if subscription is valid and not expired."""
-        from django.utils import timezone
-        if self.status != self.STATUS_ACTIVE:
-            return False
-        if self.expires_at and self.expires_at < timezone.now():
-            return False
-        return True
-    
-    def mark_as_used(self):
-        """Update last_used_at timestamp."""
-        from django.utils import timezone
-        self.last_used_at = timezone.now()
-        self.save(update_fields=['last_used_at', 'updated_at'])
-    
-    def revoke(self):
-        """Revoke this subscription."""
-        self.status = self.STATUS_REVOKED
-        self.save(update_fields=['status', 'updated_at'])
-    
-    def expire(self):
-        """Mark subscription as expired."""
-        self.status = self.STATUS_EXPIRED
-        self.save(update_fields=['status', 'updated_at'])
-
-
-class NotificationLog(TimestampedModel):
-    """
-    Comprehensive delivery tracking for push notifications.
-    Tracks delivery status, platform responses, and confirmation tracking.
-    """
-    
-    # Platform Choices
-    PLATFORM_WEB = 'web'
-    PLATFORM_ANDROID = 'android'
-    PLATFORM_IOS = 'ios'
-    
-    PLATFORM_CHOICES = [
-        (PLATFORM_WEB, _('Web')),
-        (PLATFORM_ANDROID, _('Android')),
-        (PLATFORM_IOS, _('iOS')),
-    ]
-    
-    # Status Choices
-    STATUS_SCHEDULED = 'scheduled'
-    STATUS_QUEUED = 'queued'
-    STATUS_SENDING = 'sending'
-    STATUS_SENT = 'sent'
-    STATUS_DELIVERED = 'delivered'
-    STATUS_FAILED = 'failed'
-    STATUS_CONFIRMED = 'confirmed'
-    STATUS_BOUNCED = 'bounced'
-    STATUS_EXPIRED = 'expired'
-    
-    STATUS_CHOICES = [
-        (STATUS_SCHEDULED, _('Scheduled')),
-        (STATUS_QUEUED, _('Queued')),
-        (STATUS_SENDING, _('Sending')),
-        (STATUS_SENT, _('Sent')),
-        (STATUS_DELIVERED, _('Delivered')),
-        (STATUS_FAILED, _('Failed')),
-        (STATUS_CONFIRMED, _('Confirmed')),
-        (STATUS_BOUNCED, _('Bounced')),
-        (STATUS_EXPIRED, _('Expired')),
-    ]
-    
-    id = models.UUIDField(
-        primary_key=True,
-        default=uuid.uuid4,
-        editable=False
-    )
-    notification = models.ForeignKey(
-        Notification,
-        on_delete=models.CASCADE,
-        related_name='delivery_logs',
-        help_text=_("Associated notification")
-    )
-    subscription = models.ForeignKey(
-        PushSubscription,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='delivery_logs',
-        help_text=_("Push subscription used for delivery")
-    )
-    user = models.ForeignKey(
-        User,
-        on_delete=models.CASCADE,
-        related_name='notification_logs',
-        help_text=_("Recipient user")
-    )
-    
-    # Platform information
-    platform = models.CharField(
-        max_length=20,
-        choices=PLATFORM_CHOICES,
-        db_index=True,
-        help_text=_("Target platform")
-    )
-    
-    # Delivery status
-    status = models.CharField(
-        max_length=20,
-        choices=STATUS_CHOICES,
-        default=STATUS_QUEUED,
-        db_index=True,
-        help_text=_("Current delivery status")
-    )
-    
-    # Scheduling
-    scheduled_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        db_index=True,
-        help_text=_("When notification is scheduled to be sent")
-    )
-    
-    # Delivery timestamps
-    queued_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text=_("When notification was queued")
-    )
-    sent_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text=_("When notification was sent to provider")
-    )
-    delivered_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text=_("When delivery was confirmed by provider")
-    )
-    confirmed_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text=_("When delivery was confirmed by device/app")
-    )
-    
-    # Platform response
-    provider_message_id = models.CharField(
-        max_length=255,
-        blank=True,
-        help_text=_("Message ID from push provider (FCM, APNs)")
-    )
-    platform_response = models.JSONField(
-        default=dict,
-        blank=True,
-        help_text=_("Raw response from push provider")
-    )
-    
-    # Error tracking
-    error_message = models.TextField(
-        blank=True,
-        help_text=_("Error message if delivery failed")
-    )
-    error_code = models.CharField(
-        max_length=100,
-        blank=True,
-        help_text=_("Error code from provider")
-    )
-    
-    # Retry tracking
-    retry_count = models.PositiveIntegerField(
-        default=0,
-        help_text=_("Number of retry attempts")
-    )
-    next_retry_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text=_("Next scheduled retry time")
-    )
-    
-    # Confirmation tracking
-    confirmation_token = models.CharField(
-        max_length=255,
-        blank=True,
-        db_index=True,
-        help_text=_("Token for delivery confirmation")
-    )
-    confirmation_received = models.BooleanField(
-        default=False,
-        help_text=_("Whether delivery confirmation was received")
-    )
-    
-    # Rich media tracking
-    has_attachment = models.BooleanField(
-        default=False,
-        help_text=_("Whether notification has rich media attachment")
-    )
-    attachment_url = models.URLField(
-        blank=True,
-        help_text=_("URL of rich media attachment")
-    )
-    
-    # Action buttons tracking
-    action_buttons = models.JSONField(
-        default=list,
-        blank=True,
-        help_text=_("Action buttons included in notification")
-    )
-    action_clicked = models.CharField(
-        max_length=100,
-        blank=True,
-        help_text=_("Which action button was clicked")
-    )
-    
-    class Meta:
-        verbose_name = _("Notification Log")
-        verbose_name_plural = _("Notification Logs")
-        ordering = ['-created_at']
-        indexes = [
-            models.Index(fields=['user', 'status', '-created_at']),
-            models.Index(fields=['notification', 'platform']),
-            models.Index(fields=['status', 'scheduled_at']),
-            models.Index(fields=['confirmation_token']),
-            models.Index(fields=['provider_message_id']),
-        ]
-    
-    def __str__(self):
-        return f"{self.platform} - {self.status} - {self.user.email}"
-    
-    def mark_as_sent(self, provider_message_id='', platform_response=None):
-        """Mark notification as sent."""
-        from django.utils import timezone
-        self.status = self.STATUS_SENT
-        self.sent_at = timezone.now()
-        if provider_message_id:
-            self.provider_message_id = provider_message_id
-        if platform_response:
-            self.platform_response = platform_response
-        self.save(update_fields=['status', 'sent_at', 'provider_message_id', 
-                                  'platform_response', 'updated_at'])
-    
-    def mark_as_delivered(self):
-        """Mark notification as delivered."""
-        from django.utils import timezone
-        self.status = self.STATUS_DELIVERED
-        self.delivered_at = timezone.now()
-        self.save(update_fields=['status', 'delivered_at', 'updated_at'])
-    
-    def mark_as_confirmed(self):
-        """Mark notification as confirmed by device/app."""
-        from django.utils import timezone
-        self.status = self.STATUS_CONFIRMED
-        self.confirmed_at = timezone.now()
-        self.confirmation_received = True
-        self.save(update_fields=['status', 'confirmed_at', 'confirmation_received', 'updated_at'])
-    
-    def mark_as_failed(self, error_message='', error_code=''):
-        """Mark notification as failed."""
-        self.status = self.STATUS_FAILED
-        self.error_message = error_message
-        self.error_code = error_code
-        self.save(update_fields=['status', 'error_message', 'error_code', 'updated_at'])
-    
-    def schedule_retry(self, next_retry_at):
-        """Schedule a retry attempt."""
-        self.retry_count += 1
-        self.next_retry_at = next_retry_at
-        self.status = self.STATUS_SCHEDULED
-        self.save(update_fields=['retry_count', 'next_retry_at', 'status', 'updated_at'])
+        return f"Push subscription for {self.user.email}"
 
 
 class NotificationDigest(TimestampedModel):
     """
-    Digest notification settings and tracking.
+    Notification digest for batching notifications.
     """
     
-    # Frequency Choices
-    FREQUENCY_HOURLY = 'hourly'
-    FREQUENCY_DAILY = 'daily'
-    FREQUENCY_WEEKLY = 'weekly'
+    # Digest Type Choices
+    TYPE_HOURLY = 'hourly'
+    TYPE_DAILY = 'daily'
+    TYPE_WEEKLY = 'weekly'
     
-    FREQUENCY_CHOICES = [
-        (FREQUENCY_HOURLY, _('Hourly')),
-        (FREQUENCY_DAILY, _('Daily')),
-        (FREQUENCY_WEEKLY, _('Weekly')),
+    TYPE_CHOICES = [
+        (TYPE_HOURLY, _('Hourly')),
+        (TYPE_DAILY, _('Daily')),
+        (TYPE_WEEKLY, _('Weekly')),
+    ]
+    
+    # Status Choices
+    STATUS_PENDING = 'pending'
+    STATUS_SENT = 'sent'
+    STATUS_FAILED = 'failed'
+    
+    STATUS_CHOICES = [
+        (STATUS_PENDING, _('Pending')),
+        (STATUS_SENT, _('Sent')),
+        (STATUS_FAILED, _('Failed')),
     ]
     
     user = models.ForeignKey(
         User,
         on_delete=models.CASCADE,
         related_name='notification_digests',
-        help_text=_("User who receives the digest")
+        help_text=_("User who receives this digest")
     )
-    frequency = models.CharField(
+    digest_type = models.CharField(
         max_length=20,
-        choices=FREQUENCY_CHOICES,
-        help_text=_("Digest frequency")
+        choices=TYPE_CHOICES,
+        help_text=_("Type of digest")
     )
     notifications = models.ManyToManyField(
         Notification,
         related_name='digests',
         help_text=_("Notifications included in this digest")
     )
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default=STATUS_PENDING,
+        help_text=_("Status of this digest")
+    )
     sent_at = models.DateTimeField(
         null=True,
         blank=True,
-        help_text=_("When the digest was sent")
+        help_text=_("When this digest was sent")
     )
     
     class Meta:
@@ -842,125 +790,75 @@ class NotificationDigest(TimestampedModel):
         ordering = ['-created_at']
     
     def __str__(self):
-        return f"{self.frequency} digest for {self.user.email}"
+        return f"{self.digest_type} digest for {self.user.email}"
 
 
 class EmailProvider(TimestampedModel):
     """
-    Email provider configuration (SendGrid, AWS SES, etc.)
+    Email provider configuration.
     """
     
-    # Provider Type Choices
-    TYPE_SENDGRID = 'sendgrid'
-    TYPE_AWS_SES = 'aws_ses'
-    TYPE_SMTP = 'smtp'
-    TYPE_MAILGUN = 'mailgun'
+    # Provider Choices
+    PROVIDER_SENDGRID = 'sendgrid'
+    PROVIDER_AWS_SES = 'aws_ses'
+    PROVIDER_SMTP = 'smtp'
     
-    TYPE_CHOICES = [
-        (TYPE_SENDGRID, _('SendGrid')),
-        (TYPE_AWS_SES, _('AWS SES')),
-        (TYPE_SMTP, _('SMTP')),
-        (TYPE_MAILGUN, _('Mailgun')),
-    ]
-    
-    # Status Choices
-    STATUS_ACTIVE = 'active'
-    STATUS_INACTIVE = 'inactive'
-    STATUS_ERROR = 'error'
-    
-    STATUS_CHOICES = [
-        (STATUS_ACTIVE, _('Active')),
-        (STATUS_INACTIVE, _('Inactive')),
-        (STATUS_ERROR, _('Error')),
+    PROVIDER_CHOICES = [
+        (PROVIDER_SENDGRID, _('SendGrid')),
+        (PROVIDER_AWS_SES, _('AWS SES')),
+        (PROVIDER_SMTP, _('SMTP')),
     ]
     
     name = models.CharField(
         max_length=100,
         help_text=_("Provider name")
     )
-    provider_type = models.CharField(
+    provider = models.CharField(
         max_length=20,
-        choices=TYPE_CHOICES,
-        help_text=_("Type of email provider")
+        choices=PROVIDER_CHOICES,
+        help_text=_("Email provider type")
+    )
+    is_active = models.BooleanField(
+        default=True,
+        db_index=True,
+        help_text=_("Whether this provider is active")
     )
     is_default = models.BooleanField(
         default=False,
         help_text=_("Whether this is the default provider")
     )
-    status = models.CharField(
-        max_length=20,
-        choices=STATUS_CHOICES,
-        default=STATUS_ACTIVE,
-        help_text=_("Provider status")
+    priority = models.PositiveIntegerField(
+        default=0,
+        help_text=_("Priority for provider selection (higher = preferred)")
     )
-    
-    # Configuration (encrypted at application level)
-    api_key = models.CharField(
-        max_length=500,
-        blank=True,
-        help_text=_("API key for the provider")
+    config = models.JSONField(
+        default=dict,
+        help_text=_("Provider-specific configuration")
     )
-    api_secret = models.CharField(
-        max_length=500,
-        blank=True,
-        help_text=_("API secret for the provider")
-    )
-    region = models.CharField(
-        max_length=50,
-        blank=True,
-        help_text=_("Region for AWS SES")
-    )
-    smtp_host = models.CharField(
-        max_length=255,
-        blank=True,
-        help_text=_("SMTP host")
-    )
-    smtp_port = models.PositiveIntegerField(
-        null=True,
-        blank=True,
-        help_text=_("SMTP port")
-    )
-    smtp_username = models.CharField(
-        max_length=255,
-        blank=True,
-        help_text=_("SMTP username")
-    )
-    smtp_password = models.CharField(
-        max_length=255,
-        blank=True,
-        help_text=_("SMTP password")
-    )
-    smtp_use_tls = models.BooleanField(
-        default=True,
-        help_text=_("Use TLS for SMTP")
-    )
-    
-    # Rate limiting
     rate_limit = models.PositiveIntegerField(
         default=100,
-        help_text=_("Emails per minute rate limit")
+        help_text=_("Rate limit per minute")
     )
-    
-    # Webhook settings
-    webhook_secret = models.CharField(
-        max_length=255,
-        blank=True,
-        help_text=_("Secret for webhook signature verification")
+    daily_limit = models.PositiveIntegerField(
+        default=10000,
+        help_text=_("Daily sending limit")
+    )
+    sent_today = models.PositiveIntegerField(
+        default=0,
+        help_text=_("Emails sent today")
+    )
+    last_reset_at = models.DateTimeField(
+        auto_now_add=True,
+        help_text=_("When the daily counter was last reset")
     )
     
     class Meta:
         verbose_name = _("Email Provider")
         verbose_name_plural = _("Email Providers")
-        ordering = ['-is_default', 'name']
+        ordering = ['-priority', 'name']
     
     def __str__(self):
-        return f"{self.name} ({self.provider_type})"
-    
-    def save(self, *args, **kwargs):
-        if self.is_default:
-            # Ensure only one default provider
-            EmailProvider.objects.filter(is_default=True).update(is_default=False)
-        super().save(*args, **kwargs)
+        return self.name
 
 
 class EmailTemplate(TimestampedModel):
@@ -968,170 +866,51 @@ class EmailTemplate(TimestampedModel):
     Email template for notifications.
     """
     
-    # Status Choices
-    STATUS_DRAFT = 'draft'
-    STATUS_ACTIVE = 'active'
-    STATUS_ARCHIVED = 'archived'
-    
-    STATUS_CHOICES = [
-        (STATUS_DRAFT, _('Draft')),
-        (STATUS_ACTIVE, _('Active')),
-        (STATUS_ARCHIVED, _('Archived')),
-    ]
-    
-    # Template Type Choices
-    TYPE_NOTIFICATION = 'notification'
-    TYPE_DIGEST = 'digest'
-    TYPE_WELCOME = 'welcome'
-    TYPE_PASSWORD_RESET = 'password_reset'
-    TYPE_VERIFICATION = 'verification'
-    TYPE_CERTIFICATE = 'certificate'
-    TYPE_MARKETING = 'marketing'
-    
-    TYPE_CHOICES = [
-        (TYPE_NOTIFICATION, _('Notification')),
-        (TYPE_DIGEST, _('Digest')),
-        (TYPE_WELCOME, _('Welcome')),
-        (TYPE_PASSWORD_RESET, _('Password Reset')),
-        (TYPE_VERIFICATION, _('Verification')),
-        (TYPE_CERTIFICATE, _('Certificate')),
-        (TYPE_MARKETING, _('Marketing')),
-    ]
-    
     name = models.CharField(
         max_length=100,
+        unique=True,
         help_text=_("Template name")
     )
-    slug = models.SlugField(
-        unique=True,
-        help_text=_("Unique template slug")
-    )
-    template_type = models.CharField(
-        max_length=30,
-        choices=TYPE_CHOICES,
-        default=TYPE_NOTIFICATION,
-        help_text=_("Type of template")
-    )
-    status = models.CharField(
-        max_length=20,
-        choices=STATUS_CHOICES,
-        default=STATUS_DRAFT,
-        help_text=_("Template status")
-    )
-    is_default = models.BooleanField(
-        default=False,
-        help_text=_("Whether this is the default template for its type")
-    )
-    
-    # Content
     subject = models.CharField(
         max_length=255,
-        help_text=_("Email subject line")
+        help_text=_("Email subject template")
     )
     html_content = models.TextField(
-        help_text=_("HTML email content")
+        help_text=_("HTML email content template")
     )
     text_content = models.TextField(
-        help_text=_("Plain text email content")
+        help_text=_("Plain text email content template")
     )
-    mjml_content = models.TextField(
+    description = models.TextField(
         blank=True,
-        help_text=_("MJML source content")
+        help_text=_("Template description")
     )
-    
-    # Styling
-    primary_color = models.CharField(
-        max_length=7,
-        default='#007bff',
-        help_text=_("Primary brand color")
+    is_active = models.BooleanField(
+        default=True,
+        db_index=True,
+        help_text=_("Whether this template is active")
     )
-    logo_url = models.URLField(
+    category = models.CharField(
+        max_length=50,
         blank=True,
-        help_text=_("URL to logo image")
-    )
-    footer_text = models.TextField(
-        blank=True,
-        help_text=_("Custom footer text")
-    )
-    
-    # Variables
-    variables_schema = models.JSONField(
-        default=dict,
-        help_text=_("JSON schema for template variables")
-    )
-    
-    # Versioning
-    version = models.PositiveIntegerField(
-        default=1,
-        help_text=_("Template version")
-    )
-    parent_template = models.ForeignKey(
-        'self',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='versions',
-        help_text=_("Parent template for versioning")
-    )
-    
-    # Usage statistics
-    send_count = models.PositiveIntegerField(
-        default=0,
-        help_text=_("Total emails sent using this template")
-    )
-    open_count = models.PositiveIntegerField(
-        default=0,
-        help_text=_("Total opens")
-    )
-    click_count = models.PositiveIntegerField(
-        default=0,
-        help_text=_("Total clicks")
-    )
-    last_used_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text=_("When template was last used")
+        help_text=_("Template category")
     )
     
     class Meta:
         verbose_name = _("Email Template")
         verbose_name_plural = _("Email Templates")
-        ordering = ['-updated_at']
-        indexes = [
-            models.Index(fields=['slug', 'status', 'is_default']),
-            models.Index(fields=['template_type', 'status']),
-        ]
+        ordering = ['name']
     
     def __str__(self):
-        return f"{self.name} (v{self.version})"
-    
-    def save(self, *args, **kwargs):
-        # Compile MJML to HTML if mjml_content changed
-        if self.mjml_content and not self.html_content:
-            self.compile_mjml()
-        super().save(*args, **kwargs)
-    
-    def compile_mjml(self):
-        """Compile MJML content to HTML."""
-        # This will be implemented in the service layer
-        # For now, just store MJML as-is
-        self.html_content = self.mjml_content
-    
-    def increment_send_count(self):
-        """Increment send count and update last used timestamp."""
-        from django.utils import timezone
-        self.send_count += 1
-        self.last_used_at = timezone.now()
-        self.save(update_fields=['send_count', 'last_used_at', 'updated_at'])
+        return self.name
 
 
 class EmailLog(TimestampedModel):
     """
-    Comprehensive email delivery tracking and logging.
+    Log of sent emails for tracking and debugging.
     """
     
     # Status Choices
-    STATUS_QUEUED = 'queued'
     STATUS_SENT = 'sent'
     STATUS_DELIVERED = 'delivered'
     STATUS_OPENED = 'opened'
@@ -1139,15 +918,8 @@ class EmailLog(TimestampedModel):
     STATUS_BOUNCED = 'bounced'
     STATUS_COMPLAINED = 'complained'
     STATUS_FAILED = 'failed'
-    STATUS_DEFERRED = 'deferred'
-    STATUS_DROPPED = 'dropped'
-    STATUS_UNSUBSCRIBED = 'unsubscribed'
-    STATUS_GROUP_UNSUBSCRIBED = 'group_unsubscribed'
-    STATUS_BLOCKED = 'blocked'
-    STATUS_RENDERING_FAILED = 'rendering_failed'
     
     STATUS_CHOICES = [
-        (STATUS_QUEUED, _('Queued')),
         (STATUS_SENT, _('Sent')),
         (STATUS_DELIVERED, _('Delivered')),
         (STATUS_OPENED, _('Opened')),
@@ -1155,218 +927,69 @@ class EmailLog(TimestampedModel):
         (STATUS_BOUNCED, _('Bounced')),
         (STATUS_COMPLAINED, _('Complained')),
         (STATUS_FAILED, _('Failed')),
-        (STATUS_DEFERRED, _('Deferred')),
-        (STATUS_DROPPED, _('Dropped')),
-        (STATUS_UNSUBSCRIBED, _('Unsubscribed')),
-        (STATUS_GROUP_UNSUBSCRIBED, _('Group Unsubscribed')),
-        (STATUS_BLOCKED, _('Blocked')),
-        (STATUS_RENDERING_FAILED, _('Rendering Failed')),
     ]
     
-    # Bounce Types
-    BOUNCE_TYPE_HARD = 'hard'
-    BOUNCE_TYPE_SOFT = 'soft'
-    BOUNCE_TYPE_BLOCK = 'block'
-    
-    BOUNCE_TYPE_CHOICES = [
-        (BOUNCE_TYPE_HARD, _('Hard Bounce')),
-        (BOUNCE_TYPE_SOFT, _('Soft Bounce')),
-        (BOUNCE_TYPE_BLOCK, _('Block')),
-    ]
-    
-    # Core Fields
-    message_id = models.CharField(
-        max_length=255,
-        unique=True,
-        db_index=True,
-        help_text=_("Unique message ID from provider")
-    )
-    provider = models.ForeignKey(
-        EmailProvider,
-        on_delete=models.SET_NULL,
-        null=True,
+    notification = models.ForeignKey(
+        Notification,
+        on_delete=models.CASCADE,
         related_name='email_logs',
-        help_text=_("Email provider used")
-    )
-    template = models.ForeignKey(
-        EmailTemplate,
-        on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name='email_logs',
-        help_text=_("Template used for this email")
+        help_text=_("Related notification")
     )
-    
-    # Recipient Information
-    recipient_email = models.EmailField(
-        db_index=True,
-        help_text=_("Recipient email address")
+    recipient = models.EmailField(
+        help_text=_("Email recipient")
     )
-    recipient_user = models.ForeignKey(
-        User,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='email_logs',
-        help_text=_("User recipient if applicable")
-    )
-    
-    # Sender Information
-    from_email = models.EmailField(
-        help_text=_("From email address")
-    )
-    from_name = models.CharField(
-        max_length=100,
-        blank=True,
-        help_text=_("From name")
-    )
-    reply_to = models.EmailField(
-        blank=True,
-        help_text=_("Reply-to email address")
-    )
-    
-    # Content
     subject = models.CharField(
         max_length=255,
         help_text=_("Email subject")
     )
-    html_body = models.TextField(
+    template = models.CharField(
+        max_length=100,
         blank=True,
-        help_text=_("HTML email body")
+        help_text=_("Template used")
     )
-    text_body = models.TextField(
-        blank=True,
-        help_text=_("Plain text email body")
-    )
-    template_variables = models.JSONField(
-        default=dict,
-        blank=True,
-        help_text=_("Variables used in template rendering")
-    )
-    
-    # Status Tracking
     status = models.CharField(
-        max_length=30,
+        max_length=20,
         choices=STATUS_CHOICES,
-        default=STATUS_QUEUED,
+        default=STATUS_SENT,
         db_index=True,
-        help_text=_("Current delivery status")
+        help_text=_("Email status")
     )
-    
-    # Timestamps
-    queued_at = models.DateTimeField(
-        auto_now_add=True,
-        help_text=_("When email was queued")
+    provider = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text=_("Email provider used")
+    )
+    message_id = models.CharField(
+        max_length=255,
+        blank=True,
+        db_index=True,
+        help_text=_("Provider message ID")
     )
     sent_at = models.DateTimeField(
         null=True,
         blank=True,
-        help_text=_("When email was sent")
+        help_text=_("When the email was sent")
     )
     delivered_at = models.DateTimeField(
         null=True,
         blank=True,
-        help_text=_("When email was delivered")
+        help_text=_("When the email was delivered")
     )
     opened_at = models.DateTimeField(
         null=True,
         blank=True,
-        help_text=_("When email was first opened")
+        help_text=_("When the email was opened")
     )
     clicked_at = models.DateTimeField(
         null=True,
         blank=True,
-        help_text=_("When first link was clicked")
+        help_text=_("When a link was clicked")
     )
-    
-    # Engagement Tracking
-    open_count = models.PositiveIntegerField(
-        default=0,
-        help_text=_("Number of times opened")
-    )
-    click_count = models.PositiveIntegerField(
-        default=0,
-        help_text=_("Number of times clicked")
-    )
-    last_opened_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text=_("Last open timestamp")
-    )
-    last_clicked_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text=_("Last click timestamp")
-    )
-    
-    # Bounce/Complaint Information
-    bounce_type = models.CharField(
-        max_length=20,
-        choices=BOUNCE_TYPE_CHOICES,
-        blank=True,
-        help_text=_("Type of bounce")
-    )
-    bounce_reason = models.TextField(
-        blank=True,
-        help_text=_("Bounce reason/description")
-    )
-    bounce_diagnostic = models.TextField(
-        blank=True,
-        help_text=_("Diagnostic information")
-    )
-    
-    # Error Information
     error_message = models.TextField(
         blank=True,
         help_text=_("Error message if failed")
-    )
-    error_code = models.CharField(
-        max_length=50,
-        blank=True,
-        help_text=_("Provider error code")
-    )
-    
-    # Provider Response
-    provider_response = models.JSONField(
-        default=dict,
-        blank=True,
-        help_text=_("Raw provider API response")
-    )
-    
-    # IP & User Agent
-    ip_address = models.GenericIPAddressField(
-        null=True,
-        blank=True,
-        help_text=_("IP address for opens/clicks")
-    )
-    user_agent = models.TextField(
-        blank=True,
-        help_text=_("User agent for opens/clicks")
-    )
-    
-    # Retry Information
-    retry_count = models.PositiveIntegerField(
-        default=0,
-        help_text=_("Number of retry attempts")
-    )
-    next_retry_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text=_("Next scheduled retry time")
-    )
-    
-    # Campaign/Category
-    campaign_id = models.CharField(
-        max_length=100,
-        blank=True,
-        db_index=True,
-        help_text=_("Campaign identifier")
-    )
-    category = models.CharField(
-        max_length=50,
-        blank=True,
-        db_index=True,
-        help_text=_("Email category")
     )
     
     class Meta:
@@ -1374,184 +997,72 @@ class EmailLog(TimestampedModel):
         verbose_name_plural = _("Email Logs")
         ordering = ['-created_at']
         indexes = [
-            models.Index(fields=['recipient_email', '-created_at']),
-            models.Index(fields=['status', '-created_at']),
-            models.Index(fields=['provider', '-created_at']),
-            models.Index(fields=['template', '-created_at']),
-            models.Index(fields=['campaign_id', '-created_at']),
-            models.Index(fields=['recipient_user', '-created_at']),
+            models.Index(fields=['recipient', 'created_at']),
+            models.Index(fields=['status', 'created_at']),
+            models.Index(fields=['message_id']),
         ]
     
     def __str__(self):
-        return f"{self.message_id} - {self.recipient_email}"
-    
-    def mark_as_sent(self):
-        """Mark email as sent."""
-        from django.utils import timezone
-        self.status = self.STATUS_SENT
-        self.sent_at = timezone.now()
-        self.save(update_fields=['status', 'sent_at', 'updated_at'])
-    
-    def mark_as_delivered(self):
-        """Mark email as delivered."""
-        from django.utils import timezone
-        self.status = self.STATUS_DELIVERED
-        self.delivered_at = timezone.now()
-        self.save(update_fields=['status', 'delivered_at', 'updated_at'])
-    
-    def mark_as_opened(self, ip_address=None, user_agent=None):
-        """Mark email as opened."""
-        from django.utils import timezone
-        self.status = self.STATUS_OPENED
-        self.open_count += 1
-        self.last_opened_at = timezone.now()
-        if not self.opened_at:
-            self.opened_at = timezone.now()
-        if ip_address:
-            self.ip_address = ip_address
-        if user_agent:
-            self.user_agent = user_agent
-        self.save(update_fields=['status', 'open_count', 'opened_at', 
-                                  'last_opened_at', 'ip_address', 
-                                  'user_agent', 'updated_at'])
-    
-    def mark_as_clicked(self, ip_address=None, user_agent=None):
-        """Mark email as clicked."""
-        from django.utils import timezone
-        self.status = self.STATUS_CLICKED
-        self.click_count += 1
-        self.last_clicked_at = timezone.now()
-        if not self.clicked_at:
-            self.clicked_at = timezone.now()
-        if ip_address:
-            self.ip_address = ip_address
-        if user_agent:
-            self.user_agent = user_agent
-        self.save(update_fields=['status', 'click_count', 'clicked_at',
-                                  'last_clicked_at', 'ip_address',
-                                  'user_agent', 'updated_at'])
-    
-    def mark_as_bounced(self, bounce_type, reason='', diagnostic=''):
-        """Mark email as bounced."""
-        self.status = self.STATUS_BOUNCED
-        self.bounce_type = bounce_type
-        self.bounce_reason = reason
-        self.bounce_diagnostic = diagnostic
-        self.save(update_fields=['status', 'bounce_type', 'bounce_reason',
-                                  'bounce_diagnostic', 'updated_at'])
-    
-    def mark_as_complained(self, reason=''):
-        """Mark email as complained (spam complaint)."""
-        self.status = self.STATUS_COMPLAINED
-        self.bounce_reason = reason
-        self.save(update_fields=['status', 'bounce_reason', 'updated_at'])
-    
-    def mark_as_failed(self, error_message='', error_code=''):
-        """Mark email as failed."""
-        self.status = self.STATUS_FAILED
-        self.error_message = error_message
-        self.error_code = error_code
-        self.save(update_fields=['status', 'error_message', 'error_code', 'updated_at'])
-    
-    def increment_retry(self, next_retry=None):
-        """Increment retry count and set next retry time."""
-        self.retry_count += 1
-        if next_retry:
-            self.next_retry_at = next_retry
-        self.save(update_fields=['retry_count', 'next_retry_at', 'updated_at'])
+        return f"Email to {self.recipient}"
 
 
 class EmailEvent(TimestampedModel):
     """
-    Individual email events from provider webhooks.
-    Tracks all events for detailed analytics and debugging.
+    Email event from webhook callbacks (SendGrid, SES).
     """
     
-    # Event Types
-    EVENT_PROCESSED = 'processed'
-    EVENT_DROPPED = 'dropped'
+    # Event Type Choices
     EVENT_DELIVERED = 'delivered'
-    EVENT_DEFERRED = 'deferred'
     EVENT_BOUNCE = 'bounce'
-    EVENT_BLOCK = 'block'
+    EVENT_COMPLAINT = 'complaint'
     EVENT_OPEN = 'open'
     EVENT_CLICK = 'click'
-    EVENT_SPAM_REPORT = 'spamreport'
-    EVENT_UNSUBSCRIBE = 'unsubscribe'
-    EVENT_GROUP_UNSUBSCRIBE = 'group_unsubscribe'
-    EVENT_GROUP_RESUBSCRIBE = 'group_resubscribe'
-    EVENT_RENDERING_FAILURE = 'rendering_failure'
+    EVENT_DEFERRED = 'deferred'
+    EVENT_DROPPED = 'dropped'
+    EVENT_PROCESSED = 'processed'
     EVENT_SEND = 'send'
-    EVENT_REJECT = 'reject'
-    EVENT_COMPLAINT = 'complaint'
     
     EVENT_CHOICES = [
-        (EVENT_PROCESSED, _('Processed')),
-        (EVENT_DROPPED, _('Dropped')),
         (EVENT_DELIVERED, _('Delivered')),
-        (EVENT_DEFERRED, _('Deferred')),
         (EVENT_BOUNCE, _('Bounce')),
-        (EVENT_BLOCK, _('Block')),
+        (EVENT_COMPLAINT, _('Complaint')),
         (EVENT_OPEN, _('Open')),
         (EVENT_CLICK, _('Click')),
-        (EVENT_SPAM_REPORT, _('Spam Report')),
-        (EVENT_UNSUBSCRIBE, _('Unsubscribe')),
-        (EVENT_GROUP_UNSUBSCRIBE, _('Group Unsubscribe')),
-        (EVENT_GROUP_RESUBSCRIBE, _('Group Resubscribe')),
-        (EVENT_RENDERING_FAILURE, _('Rendering Failure')),
+        (EVENT_DEFERRED, _('Deferred')),
+        (EVENT_DROPPED, _('Dropped')),
+        (EVENT_PROCESSED, _('Processed')),
         (EVENT_SEND, _('Send')),
-        (EVENT_REJECT, _('Reject')),
-        (EVENT_COMPLAINT, _('Complaint')),
-    ]
-    
-    # Event Sources
-    SOURCE_SENDGRID = 'sendgrid'
-    SOURCE_AWS_SES = 'aws_ses'
-    SOURCE_INTERNAL = 'internal'
-    
-    SOURCE_CHOICES = [
-        (SOURCE_SENDGRID, _('SendGrid')),
-        (SOURCE_AWS_SES, _('AWS SES')),
-        (SOURCE_INTERNAL, _('Internal')),
     ]
     
     email_log = models.ForeignKey(
         EmailLog,
         on_delete=models.CASCADE,
         related_name='events',
-        help_text=_("Associated email log entry")
+        null=True,
+        blank=True,
+        help_text=_("Related email log")
     )
     event_type = models.CharField(
-        max_length=30,
+        max_length=20,
         choices=EVENT_CHOICES,
         db_index=True,
         help_text=_("Type of email event")
     )
-    event_source = models.CharField(
-        max_length=20,
-        choices=SOURCE_CHOICES,
-        db_index=True,
-        help_text=_("Source of the event")
+    provider = models.CharField(
+        max_length=50,
+        help_text=_("Provider that sent this event")
     )
-    
-    # Event Data
-    event_id = models.CharField(
+    message_id = models.CharField(
         max_length=255,
-        blank=True,
-        help_text=_("Provider event ID")
+        db_index=True,
+        help_text=_("Provider message ID")
+    )
+    recipient = models.EmailField(
+        help_text=_("Email recipient")
     )
     timestamp = models.DateTimeField(
-        db_index=True,
-        help_text=_("When the event occurred (provider timestamp)")
+        help_text=_("When the event occurred (from provider)")
     )
-    
-    # Provider-Specific Data
-    provider_payload = models.JSONField(
-        default=dict,
-        help_text=_("Raw event payload from provider")
-    )
-    
-    # Parsed Event Data
     ip_address = models.GenericIPAddressField(
         null=True,
         blank=True,
@@ -1559,65 +1070,19 @@ class EmailEvent(TimestampedModel):
     )
     user_agent = models.TextField(
         blank=True,
-        help_text=_("User agent string")
+        help_text=_("User agent string (for open/click events)")
     )
     url = models.URLField(
         blank=True,
-        help_text=_("URL for click events")
+        help_text=_("URL clicked (for click events)")
     )
     reason = models.TextField(
         blank=True,
-        help_text=_("Reason for event (bounce, drop, etc.)")
+        help_text=_("Reason for bounce/complaint")
     )
-    response = models.TextField(
-        blank=True,
-        help_text=_("SMTP response or error message")
-    )
-    
-    # Bounce/Complaint Details
-    bounce_type = models.CharField(
-        max_length=20,
-        blank=True,
-        help_text=_("Bounce type")
-    )
-    bounce_class = models.CharField(
-        max_length=50,
-        blank=True,
-        help_text=_("Bounce classification")
-    )
-    feedback_id = models.CharField(
-        max_length=255,
-        blank=True,
-        help_text=_("Feedback ID for complaints")
-    )
-    
-    # Geolocation (for opens/clicks)
-    country = models.CharField(
-        max_length=100,
-        blank=True,
-        help_text=_("Country from IP geolocation")
-    )
-    city = models.CharField(
-        max_length=100,
-        blank=True,
-        help_text=_("City from IP geolocation")
-    )
-    
-    # Device/Client Info
-    device_type = models.CharField(
-        max_length=50,
-        blank=True,
-        help_text=_("Device type (desktop, mobile, tablet)")
-    )
-    client_name = models.CharField(
-        max_length=100,
-        blank=True,
-        help_text=_("Email client name")
-    )
-    client_os = models.CharField(
-        max_length=100,
-        blank=True,
-        help_text=_("Operating system")
+    raw_data = models.JSONField(
+        default=dict,
+        help_text=_("Raw event data from provider")
     )
     
     class Meta:
@@ -1625,10 +1090,10 @@ class EmailEvent(TimestampedModel):
         verbose_name_plural = _("Email Events")
         ordering = ['-timestamp']
         indexes = [
-            models.Index(fields=['email_log', 'event_type', '-timestamp']),
-            models.Index(fields=['event_source', 'event_type', '-timestamp']),
+            models.Index(fields=['message_id', 'event_type']),
+            models.Index(fields=['recipient', 'event_type']),
             models.Index(fields=['timestamp']),
         ]
     
     def __str__(self):
-        return f"{self.event_type} - {self.email_log.message_id}"
+        return f"{self.event_type} event for {self.recipient}"
